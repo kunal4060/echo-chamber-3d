@@ -29,7 +29,7 @@
 // ---------------------------------------------------------------- C ----
 // 2D values copied verbatim from build/core.js, then the 3D additions.
 const C = {
-  TILE: 40, W: 15, H: 11,           // 2D canvas play area 600x440 (kept for parity)
+  TILE: 40, W: 19, H: 14,           // v6: map expanded 15x11 -> 19x14 (+65% floor)
   SONAR_REVEAL_R: 6,                // tiles (Euclidean)
   SONAR_REVEAL_T: 2.5,              // seconds of visibility
   SONAR_CD: 4,                      // seconds cooldown
@@ -70,6 +70,19 @@ const C = {
   CROUCH_H: 0.95,                   // camera eye height crouched
   WALL_H: 3.2,                      // wall box height
   P_RADIUS: 0.35,                   // player collision radius (world units)
+  // --- v6 feature additions ---
+  TORCH_DRAIN: 100 / 180,          // battery %/sec while on (~3 min total)
+  TORCH_RECHARGE: 4,               // battery %/sec while off
+  TORCH_RANGE: 8,                  // tiles of spotlight throw
+  TORCH_SEE_R: 5,                  // creature "sees" the beam inside this range (LOS)
+  TORCH_SEE_SUSP: 9,               // suspicion/sec while lit and seen
+  BATT_N: 4, BATT_RECHARGE: 50,    // battery cell pickups: count, % restored
+  SHOT_N: 3,                       // adrenaline syringes hidden in the lab
+  SHOT_DUR: 10,                    // seconds of effect
+  SHOT_CD: 30,                     // seconds before another injection
+  SHOT_SPEED_MULT: 1.4,            // move speed multiplier while active
+  SHOT_NOISE_R: 2, SHOT_SUSP: 15,  // the injection hiss is audible
+  LOG_READ_R: 1.7,                 // audio-log read radius (same as notes)
 };
 
 // ---------------------------------------------------------------- G ----
@@ -82,7 +95,8 @@ const G = {
   creature: { x:6, y:4, cstate:'ROAM', susp:0, tgt:null, path:[],
               tickT:0, lookT:0, searchT:0, stuckN:0, smashT:0 },
   keycards: [],              // [{x,y,taken}]
-  exit: { x:13, y:6, open:false },
+  exits: [],                 // v6: [{x,y,id,name,open}] MAIN/VENT/SERVICE
+  exitUsed: null,            // v6: id of the exit the player escaped through
   radios: [],                // [{tx,ty,t,tick}] active radios, t counts down
   throwsLeft: 3, radiosLeft: 2,
   keys: 0,                   // keycards collected (KEPT across restarts)
@@ -114,25 +128,46 @@ const G = {
   mapOpen: false,            // tactical map overlay open (sim frozen, like notes)
   visited: null,             // Uint8Array(W*H): 1 = player has stood here (fog of war)
   seenKC: [false,false,false], // keycard intel: seen via sonar/proximity
-  seenExit: false,           // exit intel: seen via sonar/proximity
+  seenExit: [false, false, false], // v6: per-exit intel (MAIN/VENT/SERVICE)
   pingMark: null,            // last-known creature {x,y,rt} from a sonar ping (real-time fade)
+  // --- v6 feature state ---
+  torchOn: false,            // flashlight on (F)
+  batt: 100,                 // flashlight battery 0..100
+  battCells: [],             // [{x,y,taken}] battery pickups
+  shots: 0,                  // adrenaline syringes carried
+  syringes: [],              // [{x,y,taken}] syringe pickups
+  shotFxT: 0,                // adrenaline effect timer (sec left)
+  shotCdT: 0,                // adrenaline cooldown timer (sec left)
+  nearLog: -1,               // index of readable audio log in range
+  logsRead: [],              // bool per AUDIO_LOGS (systems.js owns the data)
+  seenLog: [],               // audio-log map intel
+  camOpen: -1,               // CCTV camera view: -1 off, else index into CAMS
+  speedT: 0,                 // v6 speedrun timer: sec since leaving intro
+  bestT: 0,                  // best time for G.difficulty (localStorage)
+  newBest: false,            // set on WIN when the record falls
 };
 G.reveal = new Float32Array(C.W * C.H);
 G.reveal.fill(-1e3);         // unrevealed sentinel (avoids a full-map flash at t=0)
 
 // ------------------------------------------------------------- LEVEL ---
+// v6: expanded 19x14. The original 15x11 block is preserved verbatim in the
+// top-left (player/keycards/creature/MAIN exit untouched); the east wing
+// holds the SECURITY CCTV room + VENT exit, the south wing holds SERVICE.
 const LEVEL = [
-  "###############",
-  "#P.....#...#1.#",
-  "#.#....#..#.#.#",
-  "#.#...........#",
-  "#.....C#......#",
-  "###.#######.###",
-  "#......#.....E#",
-  "#.#.........#.#",
-  "#.#....#....#.#",
-  "#2.....#....3.#",
-  "###############",
+  "###################",
+  "#P.....#...#1.#.V.#",
+  "#.#....#..#.#.#...#",
+  "#.#...............#",
+  "#.....C#......#...#",
+  "###.#######.###.###",
+  "#......#.....E#...#",
+  "#.#.........#.....#",
+  "#.#....#....#.#...#",
+  "#2.....#....3...###",
+  "####.#####.####.###",
+  "#.................#",
+  "#.....##..S..##...#",
+  "###################",
 ];
 
 // ------------------------------------------- v5: difficulty selector --
@@ -162,6 +197,9 @@ const W3 = {
   keyBeams: [],       // v5: additive glow pillars above keycards (visibility)
   keyLights: [],      // v5: pulsing point lights at keycard spots
   exitMesh: null,
+  exitMeshes: [],      // v6: one door group per exit (G.exits order)
+  torch: null,         // v6: flashlight spotlight (attached to camera)
+  torchTarget: null,   // v6: spotlight target object
   radioMeshes: [],
   ringGroup: null,
   playerLight: null,
@@ -367,10 +405,26 @@ function buildMaze3D() {
 
 // Shared LEVEL parser: fills G.grid and the raw spawn/entity spots.
 // Called once by buildMaze3D and again by every initLevel3D.
+// v6: fixed CCTV camera positions (tile coords, validated floor).
+// CAMS lives in world.js so input (C key) and render both see it; the
+// tactical map draws them from here too.
+var CAMS = [
+  { x: 2, y: 1 },   // CAM 01 — entrance corridor
+  { x: 7, y: 3 },   // CAM 02 — central junction
+  { x: 13, y: 3 },  // CAM 03 — east corridor
+  { x: 4, y: 8 },   // CAM 04 — storage
+  { x: 9, y: 11 },  // CAM 05 — south corridor
+];
+// v6: SECURITY / CCTV room anchor (tile) — monitor wall, desk, dead guard.
+var CCTV_ROOM = { x: 16, y: 2 };
+
 function _parseLevel() {
   G.grid = [];
   G.keycards = [];
-  var px = 1, py = 1, cx = 6, cy = 4, ex = 13, ey = 6;
+  G.exits = [];
+  var px = 1, py = 1, cx = 6, cy = 4;
+  // v6: three exits — E=MAIN (east), V=VENT (north, security room), S=SERVICE (south).
+  var EXIT_DEFS = { E: ['MAIN', 'MAIN EXIT'], V: ['VENT', 'VENT SHAFT'], S: ['SERVICE', 'SERVICE TUNNEL'] };
   for (var y = 0; y < C.H; y++) {
     G.grid[y] = [];
     for (var x = 0; x < C.W; x++) {
@@ -378,15 +432,36 @@ function _parseLevel() {
       G.grid[y][x] = (ch === '#') ? 1 : 0;
       if (ch === 'P') { px = x; py = y; }
       else if (ch === 'C') { cx = x; cy = y; }
-      else if (ch === 'E') { ex = x; ey = y; }
+      else if (EXIT_DEFS[ch]) {
+        G.exits.push({ x: x, y: y, id: EXIT_DEFS[ch][0], name: EXIT_DEFS[ch][1], open: false });
+      }
       else if (ch === '1' || ch === '2' || ch === '3') {
         G.keycards.push({ x: x, y: y, taken: false });
       }
     }
   }
+  // Canonical order: MAIN, VENT, SERVICE (map legend + win screen rely on it).
+  var _order = { MAIN: 0, VENT: 1, SERVICE: 2 };
+  G.exits.sort(function (a, b) { return _order[a.id] - _order[b.id]; });
   G.player.x = px + 0.5; G.player.y = py + 0.5;
   G.creature.x = cx + 0.5; G.creature.y = cy + 0.5;
-  G.exit.x = ex; G.exit.y = ey;
+}
+
+// v6: speedrun best times, one slot per difficulty, localStorage.
+// Guarded for headless/test environments without localStorage.
+function _bestKey() { return 'ec3best_' + (G.difficulty || 'NORMAL'); }
+function _loadBest() {
+  try {
+    if (typeof localStorage === 'undefined') return 0;
+    var v = parseFloat(localStorage.getItem(_bestKey()));
+    return (isFinite(v) && v > 0) ? v : 0;
+  } catch (e) { return 0; }
+}
+function _saveBest(t) {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    localStorage.setItem(_bestKey(), String(t));
+  } catch (e) { /* storage unavailable — bests simply don't persist */ }
 }
 
 // ============================================= procedural canvas textures
@@ -1114,6 +1189,249 @@ function _buildExitFrame(add, geo, mat) {
   _labGroup.add(g);
 }
 
+// ============================================================ v6: SECURITY
+// Dedicated CCTV room (east wing): monitor wall on the north face, operator
+// desk + chair, and a fallen guard — environmental storytelling, no gore.
+// All original geometry; monitor static is a tiny procedural canvas.
+var _cctvGroup = null;
+
+function _texCCTVStatic() {
+  var cv = document.createElement('canvas');
+  cv.width = 64; cv.height = 48;
+  var g = cv.getContext('2d');
+  g.fillStyle = '#0a1410';
+  g.fillRect(0, 0, 64, 48);
+  for (var i = 0; i < 220; i++) {
+    var v = 20 + Math.floor(Math.random() * 60);
+    g.fillStyle = 'rgb(' + v + ',' + (v + 30) + ',' + v + ')';
+    g.fillRect(Math.floor(Math.random() * 64), Math.floor(Math.random() * 48), 2, 2);
+  }
+  g.fillStyle = 'rgba(10,20,16,0.55)';
+  for (var y = 0; y < 48; y += 3) g.fillRect(0, y, 64, 1); // scanlines
+  var t = new THREE.CanvasTexture(cv);
+  return t;
+}
+
+function _buildCCTVRoom() {
+  if (_cctvGroup) {
+    _cctvGroup.traverse(function (o) {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) {
+        var ms = Array.isArray(o.material) ? o.material : [o.material];
+        for (var i = 0; i < ms.length; i++) {
+          if (ms[i].map) ms[i].map.dispose();
+          ms[i].dispose();
+        }
+      }
+    });
+    if (_cctvGroup.parent) _cctvGroup.parent.remove(_cctvGroup);
+  }
+  _cctvGroup = new THREE.Group();
+  var add = function (m) { _cctvGroup.add(m); return m; };
+  // Room anchor: CCTV_ROOM tile (16,2); monitor wall on the north face.
+  var rw = worldFromTile(CCTV_ROOM.x, CCTV_ROOM.y);
+  var dark = new THREE.MeshLambertMaterial({ color: 0x1a1d22 });
+  var deskM = new THREE.MeshLambertMaterial({ color: 0x2a2d33 });
+
+  // Monitor wall: 4x2 bank of small glowing screens facing south (+z).
+  var staticTex = _texCCTVStatic();
+  var wallZ = rw.z - C.TILE3D / 2 + 0.12; // just off the north wall
+  for (var r = 0; r < 2; r++) {
+    for (var c = 0; c < 4; c++) {
+      var tint = (r + c) % 3 === 0 ? 0x9fd8ff : 0x7dff9a;
+      var scr = new THREE.Mesh(
+        new THREE.BoxGeometry(0.85, 0.6, 0.08),
+        new THREE.MeshBasicMaterial({ map: staticTex, color: tint })
+      );
+      scr.position.set(rw.x - 1.35 + c * 0.95, 1.9 - r * 0.72, wallZ);
+      add(scr);
+      var bezel = new THREE.Mesh(
+        new THREE.BoxGeometry(0.95, 0.7, 0.05),
+        dark
+      );
+      bezel.position.set(scr.position.x, scr.position.y, wallZ - 0.03);
+      add(bezel);
+    }
+  }
+  // Operator desk + office chair.
+  var desk = new THREE.Mesh(new THREE.BoxGeometry(2.2, 0.08, 0.9), deskM);
+  desk.position.set(rw.x, 0.78, rw.z + 1.1);
+  add(desk);
+  for (var l = 0; l < 4; l++) {
+    var leg = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.78, 0.08), deskM);
+    leg.position.set(rw.x - 1.0 + (l % 2) * 2.0, 0.39, rw.z + 1.1 + (l < 2 ? -0.38 : 0.38));
+    add(leg);
+  }
+  var seat = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.09, 0.55), dark);
+  seat.position.set(rw.x + 0.4, 0.52, rw.z + 1.9);
+  seat.rotation.y = 0.5;
+  add(seat);
+  var back = new THREE.Mesh(new THREE.BoxGeometry(0.55, 0.7, 0.09), dark);
+  back.position.set(rw.x + 0.4 - Math.sin(0.5) * 0.3, 0.95, rw.z + 1.9 + Math.cos(0.5) * 0.3);
+  back.rotation.y = 0.5;
+  add(back);
+  var post = new THREE.Mesh(new THREE.CylinderGeometry(0.05, 0.05, 0.5, 8), dark);
+  post.position.set(rw.x + 0.4, 0.26, rw.z + 1.9);
+  add(post);
+  // Fallen guard: slumped dark-uniform figure beside the desk. Abstract —
+  // a torso box, a head sphere, one outstretched arm. No gore, just absence.
+  var uni = new THREE.MeshLambertMaterial({ color: 0x23262c });
+  var torso = new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.32, 0.95), uni);
+  torso.position.set(rw.x - 1.1, 0.16, rw.z + 1.7);
+  torso.rotation.y = 0.35;
+  add(torso);
+  var head = new THREE.Mesh(new THREE.SphereGeometry(0.16, 10, 8), uni);
+  head.position.set(rw.x - 1.1 + Math.sin(0.35) * 0.62, 0.14, rw.z + 1.7 + Math.cos(0.35) * 0.62);
+  add(head);
+  var arm = new THREE.Mesh(new THREE.BoxGeometry(0.14, 0.14, 0.6), uni);
+  arm.position.set(rw.x - 0.75, 0.08, rw.z + 1.35);
+  arm.rotation.y = -0.5;
+  add(arm);
+  // His dropped flashlight: small emissive cylinder, still faintly alive.
+  var fl = new THREE.Mesh(
+    new THREE.CylinderGeometry(0.045, 0.055, 0.3, 8),
+    new THREE.MeshBasicMaterial({ color: 0xffe9b8 })
+  );
+  fl.rotation.z = Math.PI / 2;
+  fl.rotation.y = 0.4;
+  fl.position.set(rw.x - 0.4, 0.06, rw.z + 1.0);
+  add(fl);
+
+  W3.scene.add(_cctvGroup);
+}
+
+// v6: small wall-mounted CCTV camera props at each CAMS tile — a dark box
+// with a red LED, angled down the corridor. Pure set dressing; the real
+// cameras are the C-key view mode.
+var _camPropGroup = null;
+function buildCamProps3D() {
+  if (_camPropGroup) {
+    _camPropGroup.traverse(function (o) {
+      if (o.geometry) o.geometry.dispose();
+      if (o.material) o.material.dispose();
+    });
+    if (_camPropGroup.parent) _camPropGroup.parent.remove(_camPropGroup);
+  }
+  _camPropGroup = new THREE.Group();
+  for (var i = 0; i < CAMS.length; i++) {
+    var w = worldFromTile(CAMS[i].x, CAMS[i].y);
+    var grp = new THREE.Group();
+    var body = new THREE.Mesh(
+      new THREE.BoxGeometry(0.22, 0.16, 0.34),
+      new THREE.MeshLambertMaterial({ color: 0x14171c })
+    );
+    var led = new THREE.Mesh(
+      new THREE.SphereGeometry(0.025, 8, 6),
+      new THREE.MeshBasicMaterial({ color: 0xff3b30 })
+    );
+    led.position.set(0, -0.05, 0.19);
+    var mount = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.03, 0.03, 0.5, 6),
+      new THREE.MeshLambertMaterial({ color: 0x2a2d33 })
+    );
+    mount.position.y = 0.3;
+    grp.add(body); grp.add(led); grp.add(mount);
+    grp.position.set(w.x - 1.6, 2.6, w.z - 1.6);
+    grp.rotation.y = Math.PI / 4;
+    _camPropGroup.add(grp);
+  }
+  W3.scene.add(_camPropGroup);
+}
+
+// ============================================================ v6: TORCH
+// Flashlight: warm-white spotlight parented to the camera each frame.
+// F toggles. Battery drains while on (~3 min), recharges slowly when off.
+function buildTorch3D() {
+  if (W3.torch) {
+    W3.scene.remove(W3.torch);
+    W3.scene.remove(W3.torchTarget);
+  }
+  W3.torchTarget = new THREE.Object3D();
+  W3.scene.add(W3.torchTarget);
+  var sp = new THREE.SpotLight(0xfff2d9, 0, C.TORCH_RANGE * C.TILE3D, 0.55, 0.45, 1.2);
+  sp.target = W3.torchTarget;
+  W3.scene.add(sp);
+  W3.torch = sp;
+  W3.torch.visible = false;
+}
+
+function toggleTorch3D() {
+  if (G.state !== 'PLAY') return;
+  if (!G.torchOn && G.batt <= 0) { if (typeof Sfx !== 'undefined') Sfx.bonk(); return; }
+  G.torchOn = !G.torchOn;
+  if (typeof Sfx !== 'undefined' && Sfx.torchClick) Sfx.torchClick(G.torchOn);
+}
+
+function syncTorch3D(dt) {
+  var lit = G.torchOn && G.batt > 0 && G.state === 'PLAY' && G.camOpen < 0;
+  if (W3.torch) {
+    W3.torch.visible = !!lit;
+    if (lit) {
+      var cp = W3.camera.position;
+      W3.torch.position.set(cp.x, cp.y, cp.z);
+      var dir = new THREE.Vector3();
+      W3.camera.getWorldDirection(dir);
+      W3.torchTarget.position.set(cp.x + dir.x * 10, cp.y + dir.y * 10, cp.z + dir.z * 10);
+      // Warm pool, steady with a faint mains flicker.
+      W3.torch.intensity = 2.4 + 0.12 * Math.sin(G.time * 31.0);
+    }
+  }
+  // Battery: drain while actually lit, slow recharge while dark.
+  if (G.state === 'PLAY' && G.noteOpen < 0 && !G.mapOpen) {
+    if (lit) {
+      G.batt = Math.max(0, G.batt - C.TORCH_DRAIN * dt);
+      if (G.batt <= 0) {
+        G.torchOn = false;
+        if (typeof Sfx !== 'undefined' && Sfx.torchClick) Sfx.torchClick(false);
+      }
+    } else if (!G.torchOn && G.batt < 100) {
+      G.batt = Math.min(100, G.batt + C.TORCH_RECHARGE * dt);
+    }
+  }
+}
+
+// ============================================================ v6: CCTV
+// C enters the camera view (cycles 1..5), ESC/C-next exits. The sim keeps
+// running — watching the specimen is safe only until it isn't.
+function cycleCam3D() {
+  if (G.state !== 'PLAY') return;
+  if (G.noteOpen >= 0 || G.mapOpen) return; // overlays own the screen
+  G.camOpen = (G.camOpen + 1) % CAMS.length;
+  if (typeof Sfx !== 'undefined' && Sfx.camStatic) Sfx.camStatic();
+  if (typeof showCam === 'function') showCam(G.camOpen);
+}
+function closeCam3D() {
+  if (G.camOpen < 0) return;
+  G.camOpen = -1;
+  if (typeof hideCam === 'function') hideCam();
+  // Try to hand pointer lock back; the click handler is the fallback.
+  try {
+    var cv = W3.renderer && W3.renderer.domElement;
+    if (cv && document.pointerLockElement !== cv) {
+      var pr = cv.requestPointerLock();
+      if (pr && pr.catch) pr.catch(function () {});
+    }
+  } catch (e) { /* headless / denied */ }
+  _snapCamera();
+}
+
+// ============================================================ v6: SHOT
+// X injects adrenaline: 10 s of +40% speed, no stamina drain. 30 s cooldown.
+// The hiss is audible — the specimen may hear it.
+function injectShot3D() {
+  if (G.state !== 'PLAY') return;
+  if (G.shots <= 0 || G.shotCdT > 0 || G.shotFxT > 0) {
+    if (typeof Sfx !== 'undefined') Sfx.bonk();
+    return;
+  }
+  G.shots--;
+  G.shotFxT = C.SHOT_DUR;
+  G.shotCdT = C.SHOT_CD;
+  var pt = { x: Math.floor(G.player.x), y: Math.floor(G.player.y) };
+  if (typeof emitNoise === 'function') emitNoise(pt.x, pt.y, C.SHOT_NOISE_R, C.SHOT_SUSP);
+  if (typeof Sfx !== 'undefined' && Sfx.inject) Sfx.inject();
+}
+
 // ---- dust: one THREE.Points cloud (~300) in a 6 m box following player ----
 function _buildDust() {
   _dustGeo = _track(new THREE.BufferGeometry());
@@ -1287,8 +1605,13 @@ function _labTick(dt) {
   }
 
   // Keycard reader dot by the exit: red locked -> green open.
+  // v6: all three exits unlock together — one dot drives them all.
   if (_exitDotMat) {
-    _exitDotMat.color.setHex(G.exit.open ? 0x2bd96a : 0xff3b30);
+    var _anyOpen = false;
+    for (var _ei = 0; _ei < G.exits.length; _ei++) {
+      if (G.exits[_ei].open) { _anyOpen = true; break; }
+    }
+    _exitDotMat.color.setHex(_anyOpen ? 0x2bd96a : 0xff3b30);
   }
 
   // Dust cloud: slow drift inside its 6 m box, box follows the player.
@@ -1356,12 +1679,15 @@ function initLevel3D(keepKeys) {
   c.cstate = 'ROAM'; c.susp = 0; c.tgt = null; c.path = [];
   c.tickT = 0; c.lookT = 0; c.searchT = 0; c.stuckN = 0; c.smashT = 0;
 
-  G.exit.open = false;
+  G.exits.forEach(function (e) { e.open = false; });
+  G.exitUsed = null;
   G.radios = [];
   G.throwsLeft = C.THROW_N;
   G.radiosLeft = C.RADIO_N;
   G.keys = keepKeys ? keysBefore : 0;
-  if (keepKeys && G.keys >= C.KEYS_NEED) G.exit.open = true; // kept 3/3: exit stays open
+  if (keepKeys && G.keys >= C.KEYS_NEED) {
+    G.exits.forEach(function (e) { e.open = true; }); // kept 3/3: exits stay open
+  }
   G.pulseCd = 0;
   G.reveal = new Float32Array(C.W * C.H);
   G.reveal.fill(-1e3);
@@ -1390,8 +1716,23 @@ function initLevel3D(keepKeys) {
   G.mapOpen = false;
   G.visited = new Uint8Array(C.W * C.H);
   G.seenKC = [false, false, false];
-  G.seenExit = false;
+  G.seenExit = [false, false, false]; // v6: one intel flag per exit
   G.pingMark = null;
+  // --- v6 resets ---
+  G.torchOn = false; G.batt = C.STAM_MAX;
+  G.battCells = (typeof BATTERY_SPOTS !== 'undefined' ? BATTERY_SPOTS : [])
+    .map(function (s) { return { x: s[0], y: s[1], taken: false }; });
+  G.shots = 0; G.shotFxT = 0; G.shotCdT = 0;
+  G.syringes = (typeof SYRINGE_SPOTS !== 'undefined' ? SYRINGE_SPOTS : [])
+    .map(function (s) { return { x: s[0], y: s[1], taken: false }; });
+  G.nearLog = -1;
+  var _nLogs = (typeof AUDIO_LOGS !== 'undefined') ? AUDIO_LOGS.length : 0;
+  G.logsRead = []; G.seenLog = [];
+  for (var _li = 0; _li < _nLogs; _li++) { G.logsRead.push(false); G.seenLog.push(false); }
+  G.camOpen = -1;
+  G.speedT = 0; G.newBest = false;
+  G.bestT = _loadBest();
+  if (typeof hideCam === 'function') hideCam();
   if (typeof hideMap === 'function') hideMap();
   _sprintCode = null; _lastTapCode = null;
 
@@ -1413,8 +1754,14 @@ function initLevel3D(keepKeys) {
   // Rebuild dynamic visuals, then the one-time full-map flash.
   // (Skipped when the intro sequence owns the reveal timing.)
   if (typeof buildKeycards3D === 'function') buildKeycards3D();
-  if (typeof buildExit3D === 'function') buildExit3D();
+  if (typeof buildExits3D === 'function') buildExits3D();
   if (typeof buildNotes3D === 'function') buildNotes3D();
+  if (typeof buildLogs3D === 'function') buildLogs3D();
+  if (typeof buildBatt3D === 'function') buildBatt3D();
+  if (typeof buildSyr3D === 'function') buildSyr3D();
+  if (typeof buildTorch3D === 'function') buildTorch3D();
+  if (typeof buildCamProps3D === 'function') buildCamProps3D();
+  if (typeof _buildCCTVRoom === 'function') _buildCCTVRoom();
   if (!_introPending && typeof startMapReveal === 'function') startMapReveal();
   if (typeof Tut !== 'undefined' && Tut.reset) Tut.reset();
 
@@ -1471,16 +1818,49 @@ function _onTileEnter(tx, ty) {
       G.angerFlash = 3;
       if (typeof Sfx !== 'undefined' && Sfx.anger) Sfx.anger();
       if (G.keys === C.KEYS_NEED) {
-        G.exit.open = true;
+        G.exits.forEach(function (e) { e.open = true; });
         if (typeof Sfx !== 'undefined' && Sfx.unlock) Sfx.unlock();
       }
       break;
     }
   }
 
-  if (tx === G.exit.x && ty === G.exit.y && G.exit.open) {
-    G.state = 'WIN';
-    if (typeof Sfx !== 'undefined' && Sfx.win) Sfx.win();
+  // v6: battery cells + adrenaline syringes.
+  var bi;
+  for (bi = 0; bi < G.battCells.length; bi++) {
+    var bc = G.battCells[bi];
+    if (!bc.taken && bc.x === tx && bc.y === ty) {
+      bc.taken = true;
+      G.batt = Math.min(100, G.batt + C.BATT_RECHARGE);
+      if (typeof Sfx !== 'undefined' && Sfx.pickup) Sfx.pickup();
+      break;
+    }
+  }
+  for (bi = 0; bi < G.syringes.length; bi++) {
+    var sy = G.syringes[bi];
+    if (!sy.taken && sy.x === tx && sy.y === ty) {
+      sy.taken = true;
+      G.shots = Math.min(9, G.shots + 1);
+      if (typeof Sfx !== 'undefined' && Sfx.pickup) Sfx.pickup();
+      break;
+    }
+  }
+
+  // v6: any open exit wins — and remembers which one.
+  for (var ei = 0; ei < G.exits.length; ei++) {
+    var ex = G.exits[ei];
+    if (tx === ex.x && ty === ex.y && ex.open) {
+      G.exitUsed = ex.id;
+      G.state = 'WIN';
+      // v6: speedrun record.
+      if (G.speedT > 0 && (G.bestT <= 0 || G.speedT < G.bestT)) {
+        G.bestT = G.speedT;
+        G.newBest = true;
+        _saveBest(G.speedT);
+      }
+      if (typeof Sfx !== 'undefined' && Sfx.win) Sfx.win();
+      break;
+    }
   }
 }
 
@@ -1510,6 +1890,8 @@ function updatePlayer3D(dt) {
     if (!wantSprint) _sprintCode = null;
     var spd = (p.sprinting ? C.SPRINT_SPEED :
                p.quiet ? C.Q_SPEED : C.P_SPEED) * C.TILE3D; // world units/sec
+    // v6: adrenaline — +40% move speed while the shot burns.
+    if (G.shotFxT > 0) spd *= C.SHOT_SPEED_MULT;
     var r = C.P_RADIUS / C.TILE3D;                          // tiles
     var nx = p.x + (dx * spd * dt) / C.TILE3D;
     var nz = p.y + (dz * spd * dt) / C.TILE3D;
@@ -1537,7 +1919,8 @@ function updatePlayer3D(dt) {
 
   // v3 stamina: drain while sprinting, regen otherwise. Below PANT_BELOW
   // the player pants audibly — periodic noise even when standing still.
-  if (p.sprinting) {
+  // v6: adrenaline suppresses the drain (the shot carries you).
+  if (p.sprinting && G.shotFxT <= 0) {
     G.stamina = Math.max(0, G.stamina - C.STAM_DRAIN * dt);
     if (G.stamina <= 0) { p.sprinting = false; _sprintCode = null; }
   } else {
@@ -1570,9 +1953,13 @@ function render3D() {
   var dtR = _lastRender ? Math.min(0.1, Math.max(0, (now - _lastRender) / 1000)) : 0.016;
   _lastRender = now;
 
+  // v6.1 TAKEN Phase 1: the world FREEZES (no flicker, no dust, no sway —
+  // dread in stillness) but we keep rendering so the FOV dread-zoom shows.
+  var frozen = (typeof G !== 'undefined' && G.takenFreeze);
+
   // Lab environment: flicker clock, room lights, hunt wash, reveal beat,
   // dust drift, dust bursts, tube buzz — all on fixed-rate clocks.
-  _labTick(dtR);
+  if (!frozen) _labTick(dtR);
 
   // Per-tile sonar reveal lighting. Freshly stamped tiles glow sonar-ice and
   // fade out over the last 0.8s of the reveal window; everything else rests
@@ -1600,16 +1987,33 @@ function render3D() {
   }
 
   // The camera light breathes almost imperceptibly — the dark never sits still.
-  if (W3.playerLight) {
+  // v6.1: frozen during the TAKEN stillness.
+  if (W3.playerLight && !frozen) {
     W3.playerLight.intensity = 0.45 + 0.05 * Math.sin(G.time * 7);
   }
 
   // Dynamic visuals owned by systems.js (guarded — load order independent).
-  if (typeof syncKeycards3D === 'function') syncKeycards3D(dtR);
-  if (typeof syncExit3D === 'function') syncExit3D(dtR);
-  if (typeof syncRadios3D === 'function') syncRadios3D(dtR);
-  if (typeof syncNotes3D === 'function') syncNotes3D(dtR);
-  if (typeof updateRings3D === 'function') updateRings3D(dtR);
+  // v6.1: skipped while the TAKEN freeze holds (frozen world).
+  if (!frozen) {
+    if (typeof syncKeycards3D === 'function') syncKeycards3D(dtR);
+    if (typeof syncExit3D === 'function') syncExit3D(dtR);
+    if (typeof syncRadios3D === 'function') syncRadios3D(dtR);
+    if (typeof syncNotes3D === 'function') syncNotes3D(dtR);
+    if (typeof syncLogs3D === 'function') syncLogs3D(dtR);
+    if (typeof syncBatt3D === 'function') syncBatt3D(dtR);
+    if (typeof syncSyr3D === 'function') syncSyr3D(dtR);
+    if (typeof syncTorch3D === 'function') syncTorch3D(dtR);
+    if (typeof updateRings3D === 'function') updateRings3D(dtR);
+  }
+
+  // v6: CCTV view — the camera sits on the security camera and stares at
+  // the specimen's CURRENT position. The sim keeps running behind the glass.
+  if (G.camOpen >= 0 && CAMS[G.camOpen]) {
+    var _cam = CAMS[G.camOpen];
+    W3.camera.position.set((_cam.x + 0.5) * C.TILE3D, 2.3, (_cam.y + 0.5) * C.TILE3D);
+    W3.camera.lookAt(G.creature.x * C.TILE3D, 1.4, G.creature.y * C.TILE3D);
+    W3.camera.rotation.z = 0;
+  }
 
   W3.renderer.render(W3.scene, W3.camera);
 }
@@ -1633,6 +2037,7 @@ function _bindPointerLock() {
 
   document.addEventListener('mousemove', function (e) {
     if (document.pointerLockElement !== cv || G.state !== 'PLAY') return;
+    if (G.camOpen >= 0) return; // v6: CCTV view owns the camera
     var p = G.player;
     p.yaw -= (e.movementX || 0) * 0.0022;
     p.pitch -= (e.movementY || 0) * 0.0022;
@@ -1641,8 +2046,9 @@ function _bindPointerLock() {
   });
 
   document.addEventListener('pointerlockchange', function () {
-    // Esc exits pointer lock natively — treat that as a pause.
-    if (document.pointerLockElement !== cv && G.state === 'PLAY') {
+    // Esc exits pointer lock natively — treat that as a pause, unless the
+    // CCTV view is open (v6: cam mode owns the screen; ESC exits the cams).
+    if (document.pointerLockElement !== cv && G.state === 'PLAY' && G.camOpen < 0) {
       G.state = 'PAUSE';
     }
   });
@@ -1695,20 +2101,34 @@ document.addEventListener('keydown', function (e) {
       if (G.state === 'PLAY' && !_actLocked && typeof doSonar3D === 'function') doSonar3D();
       break;
     case 'KeyF':
-      // v3: context-sensitive — near a note reads it, else throws.
-      if (G.state === 'PLAY' && !_actLocked) {
-        if (G.noteOpen >= 0) { _closeNote3D(); }
-        else if (G.nearNote >= 0 && typeof openNote3D === 'function') openNote3D(G.nearNote);
-        else if (typeof throwFacing3D === 'function') throwFacing3D();
-      }
+      // v6: F toggles the flashlight (was: context read/throw).
+      if (G.state === 'PLAY' && !_actLocked && typeof toggleTorch3D === 'function') toggleTorch3D();
       break;
     case 'KeyQ':
       if (G.state === 'PLAY' && !_actLocked && typeof throwFacing3D === 'function') throwFacing3D();
       break;
     case 'KeyE':
+      // v6: E reads notes AND audio logs (was: drop radio — radio moved to G).
+      if (G.state === 'PLAY' && !_actLocked) {
+        if (G.noteOpen >= 0) { _closeNote3D(); }
+        else if (G.nearNote >= 0 && typeof openNote3D === 'function') openNote3D(G.nearNote);
+        else if (G.nearLog >= 0 && typeof openLog3D === 'function') openLog3D(G.nearLog);
+      }
+      break;
+    case 'KeyG':
+      // v6: G drops a radio (moved from E).
       if (G.state === 'PLAY' && !_actLocked && typeof placeRadio3D === 'function') placeRadio3D();
       break;
     case 'KeyC':
+      // v6: C enters/cycles CCTV camera view (was: crouch — crouch moved to Z).
+      if (G.state === 'PLAY' && !_actLocked && typeof cycleCam3D === 'function') cycleCam3D();
+      break;
+    case 'KeyX':
+      // v6: X injects adrenaline.
+      if (G.state === 'PLAY' && !_actLocked && typeof injectShot3D === 'function') injectShot3D();
+      break;
+    case 'KeyZ':
+      // v6: Z toggles crouch (moved from C).
       if (G.state === 'PLAY') G.player.crouch = !G.player.crouch;
       break;
     case 'Enter':
@@ -1717,7 +2137,9 @@ document.addEventListener('keydown', function (e) {
       else if (G.state === 'WIN') { initLevel3D(false); G.state = 'PLAY'; }
       break;
     case 'Escape':
-      if (G.mapOpen) { _closeMap3D(); }
+      // v6: CCTV view exits first (it owns the screen while open).
+      if (G.camOpen >= 0 && typeof closeCam3D === 'function') { closeCam3D(); }
+      else if (G.mapOpen) { _closeMap3D(); }
       else if (G.noteOpen >= 0) { _closeNote3D(); }
       else if (G.state === 'PLAY') G.state = 'PAUSE';
       else if (G.state === 'PAUSE') G.state = 'PLAY';
@@ -1731,7 +2153,8 @@ document.addEventListener('keydown', function (e) {
       break;
     case 'KeyM':
       // v4: M opens the tactical map (was mute — mute moved to N).
-      if (G.state === 'PLAY' && !_actLocked) {
+      // v6: not while the CCTV view owns the screen.
+      if (G.state === 'PLAY' && !_actLocked && G.camOpen < 0) {
         if (G.mapOpen) _closeMap3D();
         else if (G.noteOpen < 0 && typeof openMap3D === 'function') openMap3D();
       }
@@ -2409,8 +2832,11 @@ var Creature = {
     _cr.afterT = 0;
     _cr.taken = false; _cr.takenT = 0; _cr.takenBeats = 0; _cr.lungeT = -1;
     _cr.shakeBase = null; // v3: clear FOV/shake state
+    _cr.faceT = 0; _cr.redFlashT = 0; // v6.1: clear face-phase state
     _cr.lastT = 0;
     _takenVeil(null); // remove any leftover vignette overlay
+    _takenFace(null); // v6.1: remove any leftover horror-face overlay
+    if (typeof G !== 'undefined') G.takenFreeze = false; // v6.1: unfreeze
     _cr_resetMesh(); // restore pose/visibility (retry after a TAKEN, or fresh build)
   }
 };
@@ -2508,6 +2934,187 @@ function _takenVeil(mode) {
       'radial-gradient(ellipse at center, rgba(0,0,0,0) 55%, rgba(0,0,0,0.28) 100%)';
   } else if (mode === 'black') {
     _cr_veilEl.style.background = '#000';
+  } else if (mode === 'red') {
+    // v6.1: dark red flash frames during the face phase.
+    _cr_veilEl.style.background = 'rgba(140,0,0,0.55)';
+  }
+}
+
+// v6.1 TAKEN redesign — procedural HORROR FACE overlay. Drawn ENTIRELY in
+// code on a 2D canvas (no images, no external assets): ashen mottled skin,
+// oversized asymmetric pitch-black eyes, a gaping void mouth, film grain,
+// vignette, and a chromatic-aberration ghost. Every death re-seeds the
+// blotches/teeth so repeat captures don't look identical. Redrawn at ~12 fps
+// with 2-3 px jitter during the face phase — it feels alive and WRONG.
+var _cr_faceEl = null, _cr_faceCtx = null, _cr_faceSeed = 1, _cr_faceBase = null;
+
+function _cr_mulberry(seed) {
+  var s = seed >>> 0;
+  return function () {
+    s |= 0; s = (s + 0x6D2B79F5) | 0;
+    var t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function _cr_drawFaceBase(w, h, rnd) {
+  var fc = document.createElement('canvas');
+  fc.width = w; fc.height = h;
+  var ctx = fc.getContext('2d');
+  var cx = w / 2, cy = h / 2;
+  // Face: tall oval — slightly TOO LONG (uncanny).
+  var fw = Math.min(w * 0.46, h * 0.60), fh = Math.min(h * 0.60, w * 0.72);
+
+  ctx.fillStyle = '#040404';
+  ctx.fillRect(0, 0, w, h);
+
+  // Ashen skin: pale center rotting to dark edges.
+  var skin = ctx.createRadialGradient(cx, cy - fh * 0.08, fh * 0.08, cx, cy, fh * 0.62);
+  skin.addColorStop(0, '#c9bda6');
+  skin.addColorStop(0.55, '#9d9078');
+  skin.addColorStop(1, '#453c30');
+  ctx.fillStyle = skin;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, fw / 2, fh / 2, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Mottled texture: ~90 random blotches, darker pits + pale flakes.
+  for (var i = 0; i < 90; i++) {
+    var bx = cx + (rnd() - 0.5) * fw * 0.92, by = cy + (rnd() - 0.5) * fh * 0.92;
+    var nx = (bx - cx) / (fw / 2), ny = (by - cy) / (fh / 2);
+    if (nx * nx + ny * ny > 1) continue;
+    var br = 3 + rnd() * 22;
+    if (rnd() < 0.62) {
+      ctx.fillStyle = 'rgba(52,40,30,' + (0.08 + rnd() * 0.16).toFixed(3) + ')';
+    } else {
+      ctx.fillStyle = 'rgba(224,214,192,' + (0.05 + rnd() * 0.10).toFixed(3) + ')';
+    }
+    ctx.beginPath(); ctx.arc(bx, by, br, 0, Math.PI * 2); ctx.fill();
+  }
+  // Faint burst veins across the forehead.
+  ctx.strokeStyle = 'rgba(70,50,45,0.28)';
+  ctx.lineWidth = 1.5;
+  for (var v = 0; v < 7; v++) {
+    var vx = cx + (rnd() - 0.5) * fw * 0.5, vy = cy - fh * 0.38;
+    ctx.beginPath();
+    ctx.moveTo(vx, vy);
+    ctx.lineTo(vx + (rnd() - 0.5) * 40, vy + 20 + rnd() * 30);
+    ctx.stroke();
+  }
+
+  // EYES: oversized, pitch black, ASYMMETRIC — left 13% bigger and higher.
+  var eyeY = cy - fh * 0.10;
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.ellipse(cx - fw * 0.205, eyeY - 11, fw * 0.118, fh * 0.088, -0.08, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.beginPath();
+  ctx.ellipse(cx + fw * 0.205, eyeY + 7, fw * 0.104, fh * 0.077, 0.06, 0, Math.PI * 2);
+  ctx.fill();
+  // Tiny white glints — it is LOOKING AT YOU. (This is what makes it worse.)
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.beginPath(); ctx.arc(cx - fw * 0.205 + fw * 0.032, eyeY - 11 - fh * 0.022, 3.2, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(cx + fw * 0.205 - fw * 0.022, eyeY + 7 - fh * 0.016, 2.4, 0, Math.PI * 2); ctx.fill();
+
+  // Nose: two nostril shadows, slightly off-center (nothing lines up).
+  ctx.fillStyle = 'rgba(28,20,16,0.6)';
+  ctx.beginPath(); ctx.ellipse(cx - 13, cy + fh * 0.085, 9, 14, 0.15, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(cx + 17, cy + fh * 0.095, 8, 12, -0.12, 0, Math.PI * 2); ctx.fill();
+
+  // MOUTH: gaping void — unnaturally tall, off-center, faint teeth at top.
+  var mw = fw * 0.30, mh = fh * 0.22, my = cy + fh * 0.315, mx = cx + 7;
+  ctx.fillStyle = '#000';
+  ctx.beginPath(); ctx.ellipse(mx, my, mw / 2, mh / 2, 0.03, 0, Math.PI * 2); ctx.fill();
+  var voidG = ctx.createRadialGradient(mx, my, 2, mx, my, mh * 0.55);
+  voidG.addColorStop(0, '#000000');
+  voidG.addColorStop(0.65, '#070303');
+  voidG.addColorStop(1, 'rgba(46,8,8,0)');
+  ctx.fillStyle = voidG;
+  ctx.beginPath(); ctx.ellipse(mx, my, mw / 2 * 0.82, mh / 2 * 0.88, 0.03, 0, Math.PI * 2); ctx.fill();
+  // Faint teeth: uneven pale stubs along the top lip of the void.
+  ctx.fillStyle = 'rgba(198,186,164,0.55)';
+  for (var ti = 0; ti < 7; ti++) {
+    var tx = mx - mw * 0.36 + ti * (mw * 0.72 / 6);
+    var th = 5 + rnd() * 11;
+    ctx.fillRect(tx, my - mh / 2 + 3, mw * 0.72 / 8.5, th);
+  }
+  return fc;
+}
+
+// Pre-rendered film grain tile (cheap: pattern-fill, not getImageData).
+var _cr_grainTile = null;
+function _cr_grain(ctx, w, h) {
+  if (!_cr_grainTile) {
+    _cr_grainTile = document.createElement('canvas');
+    _cr_grainTile.width = 128; _cr_grainTile.height = 128;
+    var g = _cr_grainTile.getContext('2d');
+    var id = g.createImageData(128, 128);
+    for (var i = 0; i < id.data.length; i += 4) {
+      var v = (Math.random() * 255) | 0;
+      id.data[i] = v; id.data[i + 1] = v; id.data[i + 2] = v; id.data[i + 3] = 26;
+    }
+    g.putImageData(id, 0, 0);
+  }
+  ctx.save();
+  ctx.globalAlpha = 0.5;
+  var ox = (Math.random() * 128) | 0, oy = (Math.random() * 128) | 0;
+  ctx.translate(-ox, -oy);
+  ctx.fillStyle = ctx.createPattern(_cr_grainTile, 'repeat');
+  ctx.fillRect(0, 0, w + 128, h + 128);
+  ctx.restore();
+}
+
+// mode: null = remove; 'show' = create + draw once; 'jitter' = redraw with
+// random 2-3 px offset (called ~12 fps during the face phase).
+function _takenFace(mode) {
+  if (mode === null) {
+    if (_cr_faceEl && _cr_faceEl.parentNode) _cr_faceEl.parentNode.removeChild(_cr_faceEl);
+    _cr_faceEl = null; _cr_faceCtx = null; _cr_faceBase = null;
+    return;
+  }
+  var w = window.innerWidth, h = window.innerHeight;
+  if (!_cr_faceEl) {
+    _cr_faceEl = document.createElement('canvas');
+    _cr_faceEl.width = w; _cr_faceEl.height = h;
+    _cr_faceEl.style.cssText =
+      'position:fixed;inset:0;pointer-events:none;z-index:4001;background:#000;';
+    document.body.appendChild(_cr_faceEl);
+    _cr_faceCtx = _cr_faceEl.getContext('2d');
+    _cr_faceSeed = (Math.random() * 1e9) | 0;
+    _cr_faceBase = _cr_drawFaceBase(w, h, _cr_mulberry(_cr_faceSeed));
+  }
+  var ctx = _cr_faceCtx;
+  var jx = mode === 'jitter' ? (Math.random() * 6 - 3) : 0;
+  var jy = mode === 'jitter' ? (Math.random() * 6 - 3) : 0;
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, w, h);
+  // Chromatic-aberration ghost: two faint offset copies, screen-blended.
+  ctx.save();
+  ctx.globalCompositeOperation = 'screen';
+  ctx.globalAlpha = 0.16;
+  ctx.drawImage(_cr_faceBase, 3 + jx, jy);
+  ctx.globalAlpha = 0.16;
+  ctx.drawImage(_cr_faceBase, -3 + jx, 1 + jy);
+  ctx.restore();
+  ctx.globalAlpha = 1;
+  ctx.drawImage(_cr_faceBase, jx, jy);
+  // Film grain + vignette.
+  _cr_grain(ctx, w, h);
+  var vg = ctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.32,
+    w / 2, h / 2, Math.max(w, h) * 0.72);
+  vg.addColorStop(0, 'rgba(0,0,0,0)');
+  vg.addColorStop(1, 'rgba(0,0,0,0.62)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(0, 0, w, h);
+  // Jagged shake on the whole canvas (not smooth — violent).
+  if (mode === 'jitter') {
+    _cr_faceEl.style.transform =
+      'translate(' + (Math.random() * 14 - 7).toFixed(1) + 'px,' +
+      (Math.random() * 10 - 5).toFixed(1) + 'px) rotate(' +
+      (Math.random() * 1.6 - 0.8).toFixed(2) + 'deg)';
+  } else {
+    _cr_faceEl.style.transform = '';
   }
 }
 
@@ -3051,138 +3658,90 @@ function _creatureAudio(dt, dTiles, wx, wz, stepDur, moving, hunt, p, g) {
   }
 }
 
-/* TAKEN 1.2 s timeline (rung 4 — the ONLY full close look, and it kills).
+/* v6.1 TAKEN redesign — 4-phase jumpscare (research-backed).
+ * The old 3D lunge is GONE. What kills you now is a FACE.
+ * Phase 1 THE CALM (0.0-0.4 s): INSTANT total silence, the 3D world freezes
+ *   (no flicker, no dust, no sway), FOV narrows 70->65 (slow dread zoom).
+ * Phase 2 THE FACE (0.4-1.6 s): a procedurally-drawn horror face fills the
+ *   screen (2D canvas overlay), the 4-layer SCREAM hits, the face jitters at
+ *   ~12 fps with jagged shake, dark-red flash frames at 0.55/0.95/1.35 s.
+ * Phase 3 THE CUT (1.6 s): HARD CUT to pure black + total silence (no fade).
+ * Phase 4 TAKEN card (2.0 s): the existing capture->lose wiring.
  * Runs ONLY through the legitimate floor-plane grab path in checkCapture3D.
- * Beats: t-0.5 silence (all creature audio cuts) -> t-0.3 eyes out + vignette
- * -> t=0 lunge 0.45 s + caught sting -> t=0.45 hard cut to black -> the
- * existing capture->lose wiring. Lunge varies per capture (approach angle,
- * which arm leads) so repeat deaths don't turn slapstick.
  */
 function _updateTaken(dt) {
   var g = W3.creatureGroup;
   if (!g || !_rig) return;
-  var p = G.player;
   _cr.takenT += dt;
   var T = _cr.takenT;
 
-  // t-0.5 s (T=0): the silence beat. All creature audio cuts; eyes out.
-  // v3: TOTAL silence — the master bus goes black too. Absence is scary.
+  // Phase 1 — THE CALM (T=0): silence, freeze the world, hide the mesh,
+  // start the dread zoom. The scariest sound is absence.
   if (T >= 0 && !(_cr.takenBeats & 1)) {
     _cr.takenBeats |= 1;
     if (Sfx.takenSilence) { try { Sfx.takenSilence(); } catch (e) {} }
     if (Sfx.takenBlackout) { try { Sfx.takenBlackout(); } catch (e) {} }
     _cr.effRung = 4;
-    _rig.eyeMatL.color.setRGB(0, 0, 0);
-    _rig.eyeMatR.color.setRGB(0, 0, 0);
-    _rig.eyeLight.intensity = 0;
-    _rig.halo.material.opacity = 0;
-    _rig.eyeL.visible = true; _rig.eyeR.visible = true;
-    for (var fi = 0; fi < _rig.flesh.length; fi++) _rig.flesh[fi].visible = true;
-    _rig.rim.visible = true;
-    _rig.eyeLight.visible = false;
-    _rig.halo.visible = false;
+    g.visible = false; // the grab landed; what you see next is the FACE
+    G.takenFreeze = true; // render3D: freeze lab life, keep rendering for zoom
+    _cr.faceT = 0; _cr.redFlashT = 0;
   }
-  // t-0.3 s (T=0.2): screen edges darken 20% (vignette close-in).
-  if (T >= 0.2 && !(_cr.takenBeats & 2)) {
+  // Phase 1 zoom: FOV 70 -> 65 over 0.4 s (slow, dreadful).
+  if (T < 0.4 && W3.camera) {
+    var zp = Math.min(1, T / 0.4);
+    W3.camera.fov = 70 - 5 * zp;
+    W3.camera.updateProjectionMatrix();
+  }
+  // Phase 2 — THE FACE (T=0.4): face fills the screen + the SCREAM.
+  if (T >= 0.4 && !(_cr.takenBeats & 2)) {
     _cr.takenBeats |= 2;
-    _takenVeil('edge');
+    G.takenFreeze = false;
+    _takenFace('show');
+    if (Sfx.takenScream) { try { Sfx.takenScream(); } catch (e) {} }
+    else if (Sfx.takenImpact) { try { Sfx.takenImpact(); } catch (e) {} }
   }
-  // t=0 (T=0.5): lunge (rung 4) + MASSIVE impact (v3: sub-bass + dry crack).
-  if (T >= 0.5 && !(_cr.takenBeats & 4)) {
-    _cr.takenBeats |= 4;
-    _cr.lungeT = 0;
-    _cr.whiteHot = 0.15; // eyes white-hot for 150 ms
-    _cr.lungeFromX = g.position.x; _cr.lungeFromZ = g.position.z;
-    var pwx = (p.x + 0.5) * C.TILE3D, pwz = (p.y + 0.5) * C.TILE3D;
-    var dx = pwx - g.position.x, dz = pwz - g.position.z;
-    var dl = Math.hypot(dx, dz) || 1;
-    var ca = Math.cos(_cr.lungeAng), sa = Math.sin(_cr.lungeAng);
-    var rx = (dx / dl) * ca - (dz / dl) * sa;
-    var rz = (dx / dl) * sa + (dz / dl) * ca;
-    _cr.lungeToX = pwx + rx * 2.0;
-    _cr.lungeToZ = pwz + rz * 2.0;
-    // v3: store the camera base for the shake (player input is frozen,
-    // so nothing else moves the camera during the timeline).
-    if (W3.camera) {
-      _cr.shakeBase = { x: W3.camera.position.x, y: W3.camera.position.y,
-                        z: W3.camera.position.z };
+  // Phase 2 sustain (0.4-1.6): jitter the face at ~12 fps (alive/wrong).
+  if ((_cr.takenBeats & 2) && !(_cr.takenBeats & 32) && T < 1.6) {
+    _cr.faceT += dt;
+    if (_cr.faceT >= 0.08) {
+      _cr.faceT = 0;
+      _takenFace('jitter');
     }
-    if (Sfx.takenImpact) { try { Sfx.takenImpact(); } catch (e) {} }
   }
-  // t=0.45 s (T=0.95): hard cut to black + 0.4 s of true silence (v3).
+  // Red flash frames at 0.55 / 0.95 / 1.35 s (3 frames each, then gone).
+  if (T >= 0.55 && !(_cr.takenBeats & 4)) {
+    _cr.takenBeats |= 4; _takenVeil('red'); _cr.redFlashT = 0.05;
+  }
   if (T >= 0.95 && !(_cr.takenBeats & 8)) {
-    _cr.takenBeats |= 8;
+    _cr.takenBeats |= 8; _takenVeil('red'); _cr.redFlashT = 0.05;
+  }
+  if (T >= 1.35 && !(_cr.takenBeats & 16)) {
+    _cr.takenBeats |= 16; _takenVeil('red'); _cr.redFlashT = 0.05;
+  }
+  if (_cr.redFlashT > 0) {
+    _cr.redFlashT -= dt;
+    if (_cr.redFlashT <= 0) _takenVeil(null);
+  }
+  // Phase 3 — THE CUT (T=1.6): hard cut to black + total silence. No fade.
+  if (T >= 1.6 && !(_cr.takenBeats & 32)) {
+    _cr.takenBeats |= 32;
+    _takenFace(null);
     _takenVeil('black');
-    g.visible = false;
-    // Restore the camera the shake borrowed.
     if (W3.camera) {
       W3.camera.fov = 70;
       W3.camera.updateProjectionMatrix();
-      if (_cr.shakeBase) {
-        W3.camera.position.set(_cr.shakeBase.x, _cr.shakeBase.y, _cr.shakeBase.z);
-      }
       W3.camera.rotation.z = 0;
     }
-    _cr.shakeBase = null;
+    G.takenFreeze = false;
     if (Sfx.takenBlackout) { try { Sfx.takenBlackout(); } catch (e) {} }
   }
-  // T=1.35: hand off to the EXISTING capture->lose wiring.
-  if (T >= 1.35) {
+  // Phase 4 — TAKEN card (T=2.0): hand off to the EXISTING lose wiring.
+  if (T >= 2.0) {
     _takenVeil(null);
+    G.takenFreeze = false;
     G.state = 'LOSE';
     G.loseReason = 'caught';
     return;
-  }
-
-  // (6) lunge: 0.45 s — scale 1->1.6 toward the camera, arms spread wide,
-  // head tilts back (jawless face opening = pure wrongness), eyes white-hot.
-  if (_cr.lungeT >= 0 && _cr.lungeT < 0.45) {
-    _cr.lungeT += dt;
-    var lp = Math.min(1, _cr.lungeT / 0.45);
-    var e = 1 - Math.pow(1 - lp, 3); // ease-out: violent arrival
-    var s = 1 + 0.6 * e;
-    g.scale.set(s, s, s);
-    g.position.x = _cr.lungeFromX + (_cr.lungeToX - _cr.lungeFromX) * e;
-    g.position.z = _cr.lungeFromZ + (_cr.lungeToZ - _cr.lungeFromZ) * e;
-    var lead = _cr.lungeArm; // which arm leads this capture
-    _rig.shoulderL.rotation.z = 0.08 + e * 1.25 * (lead < 0 ? 1.15 : 1.0);
-    _rig.shoulderR.rotation.z = -0.08 - e * 1.25 * (lead > 0 ? 1.15 : 1.0);
-    _rig.shoulderL.rotation.x = e * 0.4;
-    _rig.shoulderR.rotation.x = e * 0.4;
-    _rig.elbowL.rotation.x = -e * 0.3;
-    _rig.elbowR.rotation.x = -e * 0.3;
-    _rig.neckG.rotation.x = -0.55 * e; // head tilts back
-    _rig.torsoG.rotation.x = 0.52 - 0.15 * e;
-    // v3: FOV PUNCH + violent screen shake. FOV kicks 70 -> 94 at peak
-    // violence and snaps back as the hard cut lands; the camera shakes
-    // hardest at lunge start and settles into the black.
-    var cam = W3.camera;
-    if (cam && _cr.shakeBase) {
-      cam.fov = 70 + 24 * Math.sin(lp * Math.PI);
-      cam.updateProjectionMatrix();
-      var shAmp = 0.34 * (1 - e) + 0.04;
-      cam.position.x = _cr.shakeBase.x + (Math.random() * 2 - 1) * shAmp;
-      cam.position.y = _cr.shakeBase.y + (Math.random() * 2 - 1) * shAmp * 0.6;
-      cam.position.z = _cr.shakeBase.z + (Math.random() * 2 - 1) * shAmp;
-      cam.rotation.z = (Math.random() * 2 - 1) * 0.07 * (1 - e);
-    }
-    // Eyes white-hot for the first 150 ms, then back to extinguished.
-    if (_cr.whiteHot > 0) {
-      _cr.whiteHot -= dt;
-      _rig.eyeMatL.color.setRGB(1, 1, 1);
-      _rig.eyeMatR.color.setRGB(1, 1, 1);
-      _rig.eyeLight.visible = true;
-      _rig.eyeLight.color.setHex(0xffffff);
-      _rig.eyeLight.intensity = 4;
-      _rig.halo.visible = true;
-      _rig.halo.material.opacity = 0.9;
-      if (_cr.whiteHot <= 0) {
-        _rig.eyeMatL.color.setRGB(0, 0, 0);
-        _rig.eyeMatR.color.setRGB(0, 0, 0);
-        _rig.eyeLight.visible = false;
-        _rig.halo.visible = false;
-      }
-    }
   }
 }
 
@@ -3227,8 +3786,10 @@ var _s_RED = 0xC0392B;  // locked blood red
 
 // Floor tiles near prominent doorways/junctions that get a wall-mounted
 // keycard reader prop. (Verified floor against LEVEL; each has a wall neighbor.)
+// v6: new-area spots appended for the east + south wings.
 var _s_READER_SPOTS = [
-  [3, 1], [9, 2], [10, 4], [6, 8], [10, 6], [2, 6]
+  [3, 1], [9, 2], [10, 4], [6, 8], [10, 6], [2, 6],
+  [15, 3], [16, 6], [10, 11], [4, 11], [9, 12]
 ];
 
 function _s_inBounds(tx, ty) {
@@ -3327,8 +3888,9 @@ function doSonar3D() {
   }
 }
 
-// v4: tactical map intel — keycards/exit the player has SEEN (close
+// v4: tactical map intel — keycards/exits the player has SEEN (close
 // proximity or a fresh sonar reveal on their tile). Unseen = not drawn.
+// v6: exits are per-exit flags; audio logs get the same treatment.
 function updateMapIntel() {
   var p = G.player, i, d, fresh;
   for (i = 0; i < G.keycards.length; i++) {
@@ -3338,11 +3900,21 @@ function updateMapIntel() {
     fresh = (G.time - G.reveal[kc.y * C.W + kc.x]) < C.SONAR_REVEAL_T;
     if (d < 3.5 || (fresh && d <= C.SONAR_REVEAL_R)) G.seenKC[i] = true;
   }
-  if (!G.seenExit) {
-    var e = G.exit;
+  for (i = 0; i < G.exits.length; i++) {
+    if (G.seenExit[i]) continue;
+    var e = G.exits[i];
     d = Math.hypot(p.x - (e.x + 0.5), p.y - (e.y + 0.5));
     fresh = (G.time - G.reveal[e.y * C.W + e.x]) < C.SONAR_REVEAL_T;
-    if (d < 3.5 || (fresh && d <= C.SONAR_REVEAL_R)) G.seenExit = true;
+    if (d < 3.5 || (fresh && d <= C.SONAR_REVEAL_R)) G.seenExit[i] = true;
+  }
+  if (typeof AUDIO_LOGS !== 'undefined') {
+    for (i = 0; i < AUDIO_LOGS.length; i++) {
+      if (G.seenLog[i]) continue;
+      var lg = AUDIO_LOGS[i];
+      d = Math.hypot(p.x - (lg.x + 0.5), p.y - (lg.y + 0.5));
+      fresh = (G.time - G.reveal[lg.y * C.W + lg.x]) < C.SONAR_REVEAL_T;
+      if (d < 3.5 || (fresh && d <= C.SONAR_REVEAL_R)) G.seenLog[i] = true;
+    }
   }
 }
 
@@ -3654,52 +4226,69 @@ function _s_makeHazardTexture() {
 // two) + junction readers around the map. Locked: deep red with a slight
 // flicker. Open (3/3): green with a glow pulse; sign lights; reader dots
 // flip red -> green.
-function buildExit3D() {
-  if (W3.exitMesh) { _s_dispose(W3.exitMesh); W3.exitMesh = null; }
-  _s_readerDots = [];
-  var c = _s_tileCenter(G.exit.x, G.exit.y);
+// v6: one exit door per exit (MAIN/VENT/SERVICE). The sign + approach
+// orient toward the neighboring floor tile (west, east, north, south).
+function _s_exitApproach(tx, ty) {
+  // ry orients the EXIT sign's +z normal toward the approaching player:
+  // west->(-1,0,0) needs -PI/2, east->(1,0,0) needs +PI/2,
+  // north->(0,0,-1) needs PI, south->(0,0,1) needs 0.
+  var dirs = [[-1, 0, -Math.PI / 2], [1, 0, Math.PI / 2], [0, -1, Math.PI], [0, 1, 0]];
+  for (var i = 0; i < dirs.length; i++) {
+    var nx = tx + dirs[i][0], ny = ty + dirs[i][1];
+    if (_s_isFloor(nx, ny)) return { dx: dirs[i][0], dz: dirs[i][1], ry: dirs[i][2] };
+  }
+  return { dx: -1, dz: 0, ry: -Math.PI / 2 }; // fallback: face west
+}
+
+function buildExit3D(tx, ty, exit, withJunctionReaders) {
+  var ap = _s_exitApproach(tx, ty);
+  var c = _s_tileCenter(tx, ty);
   var grp = new THREE.Group();
   var ox = -c.x, oz = -c.z; // children below use world coords minus group origin
 
   var frameMat = new THREE.MeshStandardMaterial({ color: 0x2a2d33, roughness: 0.8 });
+  // Posts run perpendicular to the approach axis.
+  var alongX = Math.abs(ap.dx) > 0;
   var postGeo = new THREE.BoxGeometry(0.35, C.WALL_H, 0.35);
   var postL = new THREE.Mesh(postGeo, frameMat);
-  postL.position.set(ox + c.x, C.WALL_H / 2, oz + c.z - 1.05);
+  postL.position.set(ox + c.x - (alongX ? 0 : 1.05), C.WALL_H / 2, oz + c.z - (alongX ? 1.05 : 0));
   var postR = new THREE.Mesh(postGeo, frameMat);
-  postR.position.set(ox + c.x, C.WALL_H / 2, oz + c.z + 1.05);
+  postR.position.set(ox + c.x + (alongX ? 0 : 1.05), C.WALL_H / 2, oz + c.z + (alongX ? 1.05 : 0));
   var lintel = new THREE.Mesh(
     new THREE.BoxGeometry(0.45, 0.32, 2.45),
     frameMat
   );
+  if (!alongX) lintel.rotation.y = Math.PI / 2; // lintel spans the opening
   lintel.position.set(ox + c.x, C.WALL_H - 0.16, oz + c.z);
   grp.add(postL);
   grp.add(postR);
   grp.add(lintel);
 
-  // Thin door slab facing the west approach corridor (DoubleSide-readable
-  // from every angle since it has real thickness).
+  // Thin door slab (DoubleSide-readable from every angle).
   var door = new THREE.Mesh(
     new THREE.BoxGeometry(0.16, 2.85, 1.8),
     new THREE.MeshBasicMaterial({ color: _s_RED })
   );
+  if (!alongX) door.rotation.y = Math.PI / 2;
   door.position.set(ox + c.x, 1.425, oz + c.z);
   door.userData.isDoor = true;
   grp.add(door);
   grp.userData.door = door;
+  grp.userData.exit = exit;
 
-  // BACKLIT EXIT sign above the lintel. Stays DARK until 3/3 keycards, then
-  // lights green — "the promised land, visible from afar".
+  // BACKLIT EXIT sign above the lintel, facing the approach corridor.
+  // Stays DARK until 3/3 keycards, then lights green.
   var signMat = new THREE.MeshBasicMaterial({
     map: _s_makeExitSignTexture(), side: THREE.DoubleSide
   });
   signMat.color.setHex(0x0e0e0e); // dark while locked
   var sign = new THREE.Mesh(new THREE.PlaneGeometry(1.7, 0.62), signMat);
-  sign.rotation.y = -Math.PI / 2; // face the west approach corridor
-  sign.position.set(ox + c.x, C.WALL_H + 0.38, oz + c.z);
+  sign.rotation.y = ap.ry;
+  sign.position.set(ox + c.x + ap.dx * 0.5, C.WALL_H + 0.38, oz + c.z + ap.dz * 0.5);
   grp.add(sign);
   grp.userData.signMat = signMat;
 
-  // Hazard striping at the door threshold.
+  // Hazard striping at the door threshold (approach side).
   var hzTex = _s_makeHazardTexture();
   hzTex.wrapS = hzTex.wrapT = THREE.RepeatWrapping;
   hzTex.repeat.set(2, 1);
@@ -3708,45 +4297,69 @@ function buildExit3D() {
     new THREE.MeshBasicMaterial({ map: hzTex })
   );
   hz.rotation.x = -Math.PI / 2;
-  hz.position.set(ox + c.x - 1.35, 0.02, oz + c.z);
+  if (!alongX) hz.rotation.z = Math.PI / 2;
+  hz.position.set(ox + c.x + ap.dx * 1.35, 0.02, oz + c.z + ap.dz * 1.35);
   grp.add(hz);
 
-  // Two readers flanking the double door, mounted on the frame posts.
-  // The dot's -x face already points west (the approach) — no rotation needed.
+  // Two readers flanking the double door, dots facing the approach.
   var rL = _s_makeReader();
-  rL.position.set(ox + c.x - 0.245, 1.55, oz + c.z - 1.05);
+  rL.rotation.y = ap.ry;
+  rL.position.set(ox + c.x + ap.dx * 0.3 - (alongX ? 0 : 1.05), 1.55,
+                  oz + c.z + ap.dz * 0.3 - (alongX ? 1.05 : 0));
   grp.add(rL);
   var rR = _s_makeReader();
-  rR.position.set(ox + c.x - 0.245, 1.55, oz + c.z + 1.05);
+  rR.rotation.y = ap.ry;
+  rR.position.set(ox + c.x + ap.dx * 0.3 + (alongX ? 0 : 1.05), 1.55,
+                  oz + c.z + ap.dz * 0.3 + (alongX ? 1.05 : 0));
   grp.add(rR);
 
-  // Readers at prominent doorway/junction positions around the map.
-  _s_buildJunctionReaders(grp, ox, oz);
+  // Readers at prominent doorway/junction positions around the map (once).
+  if (withJunctionReaders) _s_buildJunctionReaders(grp, ox, oz);
 
   grp.position.set(c.x, 0, c.z);
   W3.scene.add(grp);
-  W3.exitMesh = grp;
+  return grp;
+}
+
+// v6: build one exit door per exit in G.exits (MAIN/VENT/SERVICE).
+function buildExits3D() {
+  for (var i = 0; i < W3.exitMeshes.length; i++) _s_dispose(W3.exitMeshes[i]);
+  W3.exitMeshes = [];
+  _s_readerDots = [];
+  for (var e = 0; e < G.exits.length; e++) {
+    var grp = buildExit3D(G.exits[e].x, G.exits[e].y, G.exits[e], e === 0);
+    W3.exitMeshes.push(grp);
+  }
+  W3.exitMesh = W3.exitMeshes[0] || null; // compat handle
 }
 
 function syncExit3D() {
-  if (!W3.exitMesh || !W3.exitMesh.userData.door) return;
-  var ud = W3.exitMesh.userData;
-  var door = ud.door;
-  if (G.exit.open) {
-    // Unlocked: green with a brighter glow pulse.
-    var pulse = 0.85 + 0.35 * Math.sin(G.time * 3.0);
-    door.material.color.setHex(_s_GREEN).multiplyScalar(Math.min(1.2, pulse));
-  } else {
-    // Locked: deep red with a slight uneven flicker.
-    var fl = 0.62 + 0.22 * Math.sin(G.time * 13.0) + 0.08 * Math.sin(G.time * 47.0);
-    door.material.color.setHex(_s_RED).multiplyScalar(Math.max(0.3, fl));
+  var anyOpen = false;
+  for (var e = 0; e < G.exits.length; e++) {
+    if (G.exits[e].open) { anyOpen = true; break; }
   }
-  // EXIT sign: dark until 3/3, then backlit green.
-  if (ud.signMat) ud.signMat.color.setHex(G.exit.open ? 0xffffff : 0x0e0e0e);
+  for (var i = 0; i < W3.exitMeshes.length; i++) {
+    var grp = W3.exitMeshes[i];
+    if (!grp || !grp.userData.door) continue;
+    var ud = grp.userData;
+    var door = ud.door;
+    var open = !!(ud.exit && ud.exit.open);
+    if (open) {
+      // Unlocked: green with a brighter glow pulse.
+      var pulse = 0.85 + 0.35 * Math.sin(G.time * 3.0);
+      door.material.color.setHex(_s_GREEN).multiplyScalar(Math.min(1.2, pulse));
+    } else {
+      // Locked: deep red with a slight uneven flicker.
+      var fl = 0.62 + 0.22 * Math.sin(G.time * 13.0) + 0.08 * Math.sin(G.time * 47.0);
+      door.material.color.setHex(_s_RED).multiplyScalar(Math.max(0.3, fl));
+    }
+    // EXIT sign: dark until 3/3, then backlit green.
+    if (ud.signMat) ud.signMat.color.setHex(open ? 0xffffff : 0x0e0e0e);
+  }
   // Keycard reader dots flip red -> green along with the exit unlock.
-  var dotHex = G.exit.open ? _s_GREEN : _s_RED;
-  for (var i = 0; i < _s_readerDots.length; i++) {
-    _s_readerDots[i].color.setHex(dotHex);
+  var dotHex = anyOpen ? _s_GREEN : _s_RED;
+  for (var d = 0; d < _s_readerDots.length; d++) {
+    _s_readerDots[d].color.setHex(dotHex);
   }
 }
 
@@ -3995,6 +4608,203 @@ function openNote3D(i) {
   G.nearNote = -1;
   if (typeof showNote === 'function') showNote(NOTES[i].title, NOTES[i].text);
   if (typeof Sfx !== 'undefined' && Sfx.paper) Sfx.paper();
+}
+
+/* ------------------------------------------------- v6: audio logs ----- */
+// 5 "recovered audio" text logs from Lab 7's dead staff. Placed like notes
+// (E to read, phosphor overlay), but visually distinct: a chunky cassette
+// with an amber stripe instead of the cyan tablet. Two live in the SECURITY
+// room. HUD/map carry a LOGS n/5 counter.
+var AUDIO_LOGS = [
+  { x: 16, y: 3, title: 'AUDIO LOG — SGT. R. IBARRA (SECURITY)',
+    text: '[static] ...night shift, day 22. The cameras keep catching it ' +
+    'standing in corridor C just... listening. Not moving. I swear it ' +
+    'tilts its head toward the speakers when the PA crackles. It is ' +
+    'learning the building. If you are hearing this, do not trust the ' +
+    'monitors — by the time you see it, it already heard you coming.' },
+  { x: 15, y: 1, title: 'AUDIO LOG — DR. VOSS (RESONANCE LEAD)',
+    text: 'Test 9. We raised the array to 41 kHz and Subject 7 went still ' +
+    'for eleven seconds — then it mapped the entire east wing from sound ' +
+    'alone. Perfect recall. Arora says we should stop. Arora is right and ' +
+    'I hate that she is right. Tomorrow we go to 44. For science. Forgive ' +
+    'us.' },
+  { x: 10, y: 3, title: 'AUDIO LOG — DR. ARORA (CONTAINMENT)',
+    text: 'Containment is a word we use to feel better. The glass never ' +
+    'broke — it simply knew where everyone was, the way you know where ' +
+    'your own hands are. Sound is its sight. If you must move, move ' +
+    'once, then be still. Still is invisible. I am leaving the keycards ' +
+    'where only someone quiet will find them.' },
+  { x: 9, y: 12, title: 'AUDIO LOG — MAINTENANCE (J. OKORO)',
+    text: 'Service tunnel inspection. Something has been using the vents ' +
+    '— the dust patterns, they... look like listening. Like it presses ' +
+    'its head to the metal and hears the whole building breathe. I sealed ' +
+    'the north shaft but the south one would not close. It would not ' +
+    'close. I am not going back down there.' },
+  { x: 5, y: 11, title: 'AUDIO LOG — FINAL BROADCAST (UNKNOWN)',
+    text: '[long static] ...if anyone is left... the exits only open with ' +
+    'all three cards, and it gets angrier with every one you take. The ' +
+    'main door is closest to its nest. The vent is fast but it hears ' +
+    'metal. The service tunnel is long — long is quiet, quiet is life. ' +
+    'Choose. [transmission ends]' },
+];
+var _logMeshes = [];
+
+function buildLogs3D() {
+  for (var i = 0; i < _logMeshes.length; i++) _s_dispose(_logMeshes[i]);
+  _logMeshes = [];
+  for (var n = 0; n < AUDIO_LOGS.length; n++) {
+    var c = _s_tileCenter(AUDIO_LOGS[n].x, AUDIO_LOGS[n].y);
+    var grp = new THREE.Group();
+    // Chunky cassette: dark shell + amber stripe + two reel dots.
+    var shell = new THREE.Mesh(
+      new THREE.BoxGeometry(0.4, 0.07, 0.26),
+      new THREE.MeshLambertMaterial({ color: 0x1a1d22 })
+    );
+    var stripe = new THREE.Mesh(
+      new THREE.BoxGeometry(0.4, 0.075, 0.07),
+      new THREE.MeshBasicMaterial({ color: 0xF5A524 })
+    );
+    stripe.position.z = 0.08;
+    var reelG = new THREE.CylinderGeometry(0.035, 0.035, 0.08, 10);
+    var reelM = new THREE.MeshBasicMaterial({ color: 0xE8E4D8 });
+    var r1 = new THREE.Mesh(reelG, reelM);
+    r1.position.set(-0.09, 0, 0);
+    var r2 = new THREE.Mesh(reelG, reelM);
+    r2.position.set(0.09, 0, 0);
+    grp.add(shell);
+    grp.add(stripe);
+    grp.add(r1);
+    grp.add(r2);
+    grp.position.set(c.x - 0.7, 0.1, c.z + 0.55);
+    grp.rotation.y = (n * 2.2 + 0.7) % (Math.PI * 2);
+    grp.userData.phase = n * 1.4;
+    grp.userData.stripeMat = stripe.material;
+    W3.scene.add(grp);
+    _logMeshes.push(grp);
+  }
+}
+
+function syncLogs3D(dt) {
+  var p = G.player, best = -1, bestD = C.LOG_READ_R;
+  for (var i = 0; i < _logMeshes.length; i++) {
+    var m = _logMeshes[i];
+    // Amber pulse so logs read as interactive (distinct from cyan notes).
+    var gl = 0.45 + 0.3 * Math.sin(G.time * 2.1 + m.userData.phase);
+    m.userData.stripeMat.color.setRGB(0.85 * gl, 0.55 * gl, 0.12 * gl);
+    var dx = AUDIO_LOGS[i].x + 0.5 - p.x, dy = AUDIO_LOGS[i].y + 0.5 - p.y;
+    var d = Math.sqrt(dx * dx + dy * dy);
+    if (d < bestD) { bestD = d; best = i; }
+  }
+  G.nearLog = (G.state === 'PLAY' && G.noteOpen < 0) ? best : -1;
+}
+
+// Opened from world.js input (E, context-sensitive). Shares the note
+// overlay (amber title prefix marks it as a recovered recording).
+function openLog3D(i) {
+  if (i < 0 || i >= AUDIO_LOGS.length) return;
+  G.noteOpen = 100 + i; // 100+ = audio log (not a paper note)
+  G.nearLog = -1;
+  G.logsRead[i] = true;
+  if (typeof showNote === 'function') showNote(AUDIO_LOGS[i].title, AUDIO_LOGS[i].text);
+  if (typeof Sfx !== 'undefined' && Sfx.paper) Sfx.paper();
+}
+
+/* -------------------------------------------- v6: battery cells ------- */
+// 4 glowing power cells. Walk over one: +50 flashlight battery.
+// Visual: small cyan-glowing cylinder — the only cool-colored pickup.
+var BATTERY_SPOTS = [[5, 1], [11, 6], [16, 8], [3, 11]];
+var _battMeshes = [];
+
+function buildBatt3D() {
+  for (var i = 0; i < _battMeshes.length; i++) _s_dispose(_battMeshes[i]);
+  _battMeshes = [];
+  for (var k = 0; k < G.battCells.length; k++) {
+    var c = _s_tileCenter(G.battCells[k].x, G.battCells[k].y);
+    var grp = new THREE.Group();
+    var cell = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.09, 0.09, 0.34, 10),
+      new THREE.MeshBasicMaterial({ color: 0x9fe8ff })
+    );
+    var cap = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.095, 0.095, 0.05, 10),
+      new THREE.MeshLambertMaterial({ color: 0x2a2d33 })
+    );
+    cap.position.y = 0.19;
+    var cap2 = cap.clone();
+    cap2.position.y = -0.19;
+    grp.add(cell);
+    grp.add(cap);
+    grp.add(cap2);
+    grp.position.set(c.x, 0.9, c.z);
+    grp.userData.phase = k * 2.4;
+    grp.userData.cellMat = cell.material;
+    W3.scene.add(grp);
+    _battMeshes.push(grp);
+  }
+}
+
+function syncBatt3D(dt) {
+  for (var i = 0; i < _battMeshes.length; i++) {
+    var m = _battMeshes[i];
+    var bc = G.battCells[i];
+    if (!bc || bc.taken) { m.visible = false; continue; }
+    m.visible = true;
+    m.position.y = 0.9 + Math.sin(G.time * 2.4 + m.userData.phase) * 0.08;
+    m.rotation.y += dt * 1.8;
+    var gl = 0.6 + 0.4 * Math.sin(G.time * 3.1 + m.userData.phase);
+    m.userData.cellMat.color.setRGB(0.35 * gl, 0.8 * gl, 1.0 * gl);
+  }
+}
+
+/* -------------------------------------------- v6: adrenaline --------- */
+// 3 syringes hidden in the lab. Walk over one to carry it (HUD count);
+// X injects: 10 s of +40% speed, no stamina drain. 30 s cooldown.
+// Visual: small green-glowing syringe — the only green pickup.
+var SYRINGE_SPOTS = [[3, 5], [11, 9], [14, 11]];
+var _syrMeshes = [];
+
+function buildSyr3D() {
+  for (var i = 0; i < _syrMeshes.length; i++) _s_dispose(_syrMeshes[i]);
+  _syrMeshes = [];
+  for (var k = 0; k < G.syringes.length; k++) {
+    var c = _s_tileCenter(G.syringes[k].x, G.syringes[k].y);
+    var grp = new THREE.Group();
+    var barrel = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.05, 0.05, 0.4, 8),
+      new THREE.MeshBasicMaterial({ color: 0x7dff9a })
+    );
+    var needle = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.012, 0.012, 0.22, 6),
+      new THREE.MeshBasicMaterial({ color: 0xE8E4D8 })
+    );
+    needle.position.y = -0.3;
+    var plunger = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.06, 0.06, 0.06, 8),
+      new THREE.MeshLambertMaterial({ color: 0x2a2d33 })
+    );
+    plunger.position.y = 0.23;
+    grp.add(barrel);
+    grp.add(needle);
+    grp.add(plunger);
+    grp.position.set(c.x, 0.85, c.z);
+    grp.rotation.z = 0.5; // lying at a slight angle
+    grp.userData.phase = k * 1.9;
+    grp.userData.barrelMat = barrel.material;
+    W3.scene.add(grp);
+    _syrMeshes.push(grp);
+  }
+}
+
+function syncSyr3D(dt) {
+  for (var i = 0; i < _syrMeshes.length; i++) {
+    var m = _syrMeshes[i];
+    var sy = G.syringes[i];
+    if (!sy || sy.taken) { m.visible = false; continue; }
+    m.visible = true;
+    m.position.y = 0.85 + Math.sin(G.time * 2.0 + m.userData.phase) * 0.07;
+    var gl = 0.55 + 0.45 * Math.sin(G.time * 2.8 + m.userData.phase);
+    m.userData.barrelMat.color.setRGB(0.3 * gl, 1.0 * gl, 0.45 * gl);
+  }
 }
 
 /* ===== build3d/audioui.js ===== */
@@ -4565,6 +5375,24 @@ const Sfx = {
     this._tone3D('bonk', { f0: 180, dur: 0.1, type: 'sine', vol: 0.25, wet: 0 });
   },
 
+  // v6: flashlight click — short filtered snap, brighter when switching on.
+  torchClick(on) {
+    this._noise3D('torch', { dur: 0.05, fType: 'highpass', freq: 2500, vol: 0.14, wet: 0.05 });
+    this._tone3D('torch', { f0: on ? 1900 : 1400, dur: 0.04, type: 'square', vol: 0.08, wet: 0.05 });
+  },
+
+  // v6: CCTV switch — burst of monitor static + channel blip.
+  camStatic() {
+    this._noise3D('cam', { dur: 0.3, fType: 'bandpass', freq: 1800, Q: 0.8, vol: 0.12, wet: 0.2 });
+    this._tone3D('cam', { f0: 880, dur: 0.07, type: 'square', vol: 0.07, wet: 0.15, delay: 0.05 });
+  },
+
+  // v6: adrenaline injection — pressurized hiss + low thump.
+  inject() {
+    this._noise3D('inject', { dur: 0.45, fType: 'highpass', freq: 4500, vol: 0.16, wet: 0.1 });
+    this._tone3D('inject', { f0: 70, dur: 0.3, type: 'sine', vol: 0.2, wet: 0.1, delay: 0.1 });
+  },
+
   // Radio drop: soft 90 Hz thud + short static burst.
   radioDrop() {
     this._tone3D('radioDrop', { f0: 90, dur: 0.15, type: 'sine', vol: 0.2, wet: 0.1 });
@@ -4804,6 +5632,75 @@ const Sfx = {
     // Dry crack: violent transient, highpassed, NO reverb.
     this._noise3D('taken', { dur: 0.09, fType: 'highpass', freq: 2500, vol: 0.5, wet: 0 });
     this._noise3D('taken', { dur: 0.2, fType: 'bandpass', freq: 900, Q: 0.8, vol: 0.35, wet: 0, delay: 0.02 });
+  },
+
+  // v6.1 TAKEN redesign — the 4-layer SCREAM. Research: jumpscares hijack
+  // the amygdala via (1) silence->sudden loud burst contrast, (2) dissonant
+  // frequencies + sub-bass causing physical unease, (3) brevity — the whole
+  // thing peaks ~0.5 s and is gone by 1.2 s.
+  // Layer 1: sub-bass drop 60->25 Hz sine (physical chest hit).
+  // Layer 2: dissonant cluster — 5 detuned saws (700/940/1250/1680/2100 Hz
+  //   + random drift, nails-on-chalkboard) with staggered micro-delays.
+  // Layer 3: white-noise crack 0.3 s, highpassed (initial transient).
+  // Layer 4: FM "roar" — 90 Hz carrier, 37 Hz modulator, high index.
+  takenScream() {
+    const ctx = this._ctx;
+    if (!ctx) return;
+    const t = ctx.currentTime;
+    try {
+      this._master.gain.cancelScheduledValues(t);
+      this._master.gain.setValueAtTime(0.0001, t);
+      this._master.gain.exponentialRampToValueAtTime(this._muted ? 0.0001 : 0.22, t + 0.02);
+    } catch (e) {}
+    // Layer 1: sub-bass drop 60 -> 25 Hz, 1.2 s, DRY. Felt in the chest.
+    this._tone3D('scream', { f0: 60, f1: 25, dur: 1.2, type: 'sine', vol: 0.9, wet: 0 });
+    // Layer 2: dissonant cluster — 5 detuned saws, staggered attacks.
+    var cluster = [700, 940, 1250, 1680, 2100];
+    for (var i = 0; i < cluster.length; i++) {
+      var drift = (Math.random() - 0.5) * 60;
+      this._tone3D('scream', {
+        f0: cluster[i] + drift, f1: cluster[i] * 0.82 + drift,
+        dur: 1.0, type: 'sawtooth', vol: 0.16, wet: 0,
+        delay: 0.02 + i * 0.015
+      });
+    }
+    // Layer 3: white-noise crack — 0.3 s highpassed transient + band body.
+    this._noise3D('scream', { dur: 0.3, fType: 'highpass', freq: 2800, vol: 0.55, wet: 0 });
+    this._noise3D('scream', { dur: 0.5, fType: 'bandpass', freq: 1100, Q: 0.7, vol: 0.3, wet: 0, delay: 0.05 });
+    // Layer 4: FM roar — 90 Hz carrier, 37 Hz modulator, high index.
+    try {
+      var car = ctx.createOscillator(); car.type = 'sine'; car.frequency.value = 90;
+      var mod = ctx.createOscillator(); mod.type = 'sine'; mod.frequency.value = 37;
+      var modG = ctx.createGain(); modG.gain.value = 220;
+      var g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.5, t + 0.06);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 1.2);
+      mod.connect(modG); modG.connect(car.frequency);
+      car.connect(g);
+      var nodes = this._voiceOut(g, { wet: 0 });
+      nodes.unshift(car, mod, modG);
+      car.start(t); mod.start(t);
+      car.stop(t + 1.25); mod.stop(t + 1.25);
+      this._track('scream', car, nodes);
+    } catch (e) {}
+  },
+
+  // v6.1 fake-out: a DISTANT scream for the paranoia roll. Same DNA as the
+  // kill scream but quieter, bandpassed, through the corridor reverb — it
+  // sounds FAR AWAY. Nothing happens. That's the point.
+  fakeoutScream() {
+    const ctx = this._ctx;
+    if (!ctx) return;
+    this._tone3D('fakeout', { f0: 52, f1: 30, dur: 0.9, type: 'sine', vol: 0.22, wet: 0.7 });
+    var cluster = [680, 920, 1300];
+    for (var i = 0; i < cluster.length; i++) {
+      this._tone3D('fakeout', {
+        f0: cluster[i], f1: cluster[i] * 0.85, dur: 0.7,
+        type: 'sawtooth', vol: 0.05, wet: 0.8, delay: i * 0.03
+      });
+    }
+    this._noise3D('fakeout', { dur: 0.25, fType: 'bandpass', freq: 800, Q: 1.2, vol: 0.1, wet: 0.8 });
   },
 
   // v3: restore the master bus (called on level init / restart so a
@@ -5070,9 +5967,19 @@ const Sfx = {
         }
       }
 
-      // Exit hum: keep its panner on the exit door (audio landmark).
-      if (this._exitHumOn && G.exit) {
-        this._setPannerPos(this._exitHumPanner, (G.exit.x + 0.5) * T3, 1.5, (G.exit.y + 0.5) * T3);
+      // Exit hum: keep its panner on the nearest exit door (audio landmark).
+      // v6: three exits — hum the closest one to the player.
+      var _hx = null;
+      if (this._exitHumOn && G.exits && G.exits.length) {
+        var _bd = 1e9;
+        for (var _hi = 0; _hi < G.exits.length; _hi++) {
+          var _he = G.exits[_hi];
+          var _hd = Math.hypot(G.player.x - (_he.x + 0.5), G.player.y - (_he.y + 0.5));
+          if (_hd < _bd) { _bd = _hd; _hx = _he; }
+        }
+      }
+      if (this._exitHumOn && _hx) {
+        this._setPannerPos(this._exitHumPanner, (_hx.x + 0.5) * T3, 1.5, (_hx.y + 0.5) * T3);
         this._exitHumGain.gain.setTargetAtTime(0.02, t, 0.3);
       }
 
@@ -5081,6 +5988,30 @@ const Sfx = {
       if (this._clangT <= 0) {
         this._clangT = 20 + Math.random() * 25;
         this._distantClang();
+      }
+
+      // v6.1 paranoia fake-out: every 60–120 s, a 10% roll. On success: a
+      // DISTANT scream + a light flicker — but nothing happens. Never during
+      // the TAKEN timeline, never while a note or the map has the player's
+      // eyes, never in the first 45 s of a run (let them settle in first).
+      if (typeof Creature === 'undefined' || !Creature.takenActive || !Creature.takenActive()) {
+        if (this._fakeoutT == null) this._fakeoutT = 60 + Math.random() * 60;
+        this._fakeoutT -= dt;
+        if (this._fakeoutT <= 0) {
+          this._fakeoutT = 60 + Math.random() * 60;
+          if (G.time > 45 && G.noteOpen < 0 && !G.mapOpen && Math.random() < 0.10) {
+            this.fakeoutScream();
+            // Light flicker beat: 0.35 s edge vignette pulse, then gone.
+            if (typeof _takenVeil === 'function') {
+              _takenVeil('edge');
+              this._fakeoutVeilT = 0.35;
+            }
+          }
+        }
+        if (this._fakeoutVeilT > 0) {
+          this._fakeoutVeilT -= dt;
+          if (this._fakeoutVeilT <= 0 && typeof _takenVeil === 'function') _takenVeil(null);
+        }
       }
     } catch (e) {}
   }
@@ -5146,11 +6077,11 @@ const Tut = {
       case 1:
         return "SPACE — SONAR PULSE // IT MAPS THE LAB · IT HEARS YOU";
       case 2:
-        return "KEYCARD " + G.keys + "/3 // RECOVER ALL THREE · REACH THE EXIT";
+        return "KEYCARD " + G.keys + "/3 // RECOVER ALL THREE · REACH ANY EXIT";
       case 4:
         return "!! ACOUSTIC CONTACT — IT HEARD THAT. MOVE QUIETLY.";
       case 6:
-        return "Q — THROW LURE · E — DROP RADIO · STAND STILL TO HIDE";
+        return "Q — LURE · G — RADIO · F — TORCH · C — CAMS · X — SHOT · E — READ";
       default:
         return null;
     }
@@ -5265,6 +6196,45 @@ function buildHUD() {
     '.ec3-stamfill { height: 100%; width: 100%; background: #7FD4E8;',
     '  transition: width 0.15s linear; }',
     '.ec3-stamfill.low { background: #C0392B; }',
+    // v6: flashlight battery (thin amber bar, bottom-left under stamina)
+    '.ec3-battfill { height: 100%; width: 100%; background: #F5A524;',
+    '  transition: width 0.15s linear; }',
+    '.ec3-battfill.low { background: #C0392B; }',
+    // v6: syringe count row (bottom-right, under radios)
+    '.ec3-syr { display: inline-block; width: 8px; height: 14px; margin-right: 8px;',
+    '  border: 2px solid #7dff9a; border-top: none; vertical-align: -2px; position: relative; }',
+    '.ec3-syr:before { content: ""; position: absolute; top: -5px; left: 1px;',
+    '  width: 2px; height: 5px; background: #7dff9a; }',
+    // v6: speedrun timer (top-center, under the objective)
+    '.ec3-timer { font-size: 13px; letter-spacing: 4px; color: #BFEFFF; margin-top: 4px; }',
+    '.ec3-logline { font-size: 10px; letter-spacing: 3px; color: #8A939B; margin-top: 4px; }',
+    // v6: CCTV overlay (phosphor-green monitor feed)
+    '.ec3-camov { position: fixed; inset: 0; z-index: 55; display: none;',
+    '  pointer-events: none; }',
+    '.ec3-camov.on { display: block; }',
+    '.ec3-camtint { position: absolute; inset: 0;',
+    '  background: rgba(20, 60, 35, 0.22); }',
+    '.ec3-camstatic { position: absolute; inset: 0; opacity: 0.10;',
+    '  background: repeating-linear-gradient(0deg, rgba(125,255,154,0.5) 0px,',
+    '  rgba(125,255,154,0.5) 1px, transparent 1px, transparent 4px);',
+    '  animation: ec3-camroll 0.4s steps(3) infinite; }',
+    '@keyframes ec3-camroll { 0% { transform: translateY(0); }',
+    '  100% { transform: translateY(4px); } }',
+    '.ec3-camlabel { position: absolute; top: 18px; left: 22px;',
+    '  font-size: 15px; letter-spacing: 4px; color: #7dff9a;',
+    '  text-shadow: 0 0 8px rgba(125,255,154,0.8); }',
+    '.ec3-camrec { position: absolute; top: 18px; right: 22px;',
+    '  font-size: 15px; letter-spacing: 4px; color: #C0392B; }',
+    '.ec3-camrec:before { content: ""; display: inline-block; width: 10px; height: 10px;',
+    '  border-radius: 50%; background: #C0392B; margin-right: 8px;',
+    '  animation: ec3-breathe 1.2s ease-in-out infinite; }',
+    '.ec3-camhint { position: absolute; bottom: 26px; left: 50%;',
+    '  transform: translateX(-50%); font-size: 12px; letter-spacing: 3px;',
+    '  color: #7dff9a; background: rgba(5,7,10,0.6); padding: 6px 14px; }',
+    // v6: adrenaline vignette (cyan edge pulse while the shot burns)
+    '.ec3-adren { position: fixed; inset: 0; z-index: 30; pointer-events: none;',
+    '  background: radial-gradient(ellipse at center, transparent 55%,',
+    '  rgba(125,255,154,0.7) 100%); opacity: 0; }',
     // v3: anger flash ("IT IS ANGRIER") + note prompt
     '.ec3-anger { top: 20%; left: 50%; transform: translateX(-50%);',
     '  font-size: 22px; font-weight: bold; letter-spacing: 8px; color: #C0392B;',
@@ -5343,6 +6313,8 @@ function buildHUD() {
   // --- top-center objective ------------------------------------------------
   const tc = _el('div', 'ec3-hud ec3-tc', document.body);
   const objLine = _el('div', 'ec3-obj', tc);
+  const timerLine = _el('div', 'ec3-timer', tc);      // v6: speedrun clock
+  const logLine = _el('div', 'ec3-logline', tc);      // v6: audio logs found
   _el('div', 'ec3-objsub', tc).textContent = 'LAB 7 // ACOUSTIC CONTAINMENT';
 
   // --- bottom-left: access badges (keycards) --------------------------------
@@ -5370,6 +6342,10 @@ function buildHUD() {
   const radioRow = _el('div', 'ec3-count', br);
   _el('span', 'ec3-rbox', radioRow);
   const radioN = _el('span', null, radioRow);
+  // v6: adrenaline syringes carried.
+  const syrRow = _el('div', 'ec3-count', br);
+  _el('span', 'ec3-syr', syrRow);
+  const syrN = _el('span', null, syrRow);
 
   // --- tutorial line ---------------------------------------------------------
   const tut = _el('div', 'ec3-hud ec3-tut', document.body);
@@ -5400,11 +6376,33 @@ function buildHUD() {
   const stamFill = _el('div', 'ec3-stamfill', stamBar);
   stamFill.style.cssText = 'height:100%;width:100%;background:#7FD4E8;transition:width 0.15s linear;';
 
+  // --- v6: flashlight battery (bottom-left, under stamina) -----------------------
+  const battLabel = _el('div', 'ec3-hud', document.body);
+  battLabel.style.cssText = 'position:fixed;left:16px;bottom:46px;font-size:10px;letter-spacing:3px;color:#8A939B;';
+  battLabel.textContent = 'TORCH [F]';
+  const battBar = _el('div', 'ec3-hud', document.body);
+  battBar.style.cssText = 'position:fixed;left:16px;bottom:36px;width:120px;height:5px;background:rgba(232,228,216,0.12);border:1px solid rgba(232,228,216,0.2);';
+  const battFill = _el('div', 'ec3-battfill', battBar);
+  battFill.style.cssText = 'height:100%;width:100%;background:#F5A524;transition:width 0.15s linear;';
+
+  // --- v6: CCTV overlay ------------------------------------------------------------
+  const camOv = _el('div', 'ec3-camov', document.body);
+  _el('div', 'ec3-camtint', camOv);
+  _el('div', 'ec3-camstatic', camOv);
+  const camLabel = _el('div', 'ec3-camlabel', camOv);
+  const camRec = _el('div', 'ec3-camrec', camOv);
+  camRec.textContent = 'REC';
+  const camHint = _el('div', 'ec3-camhint', camOv);
+  camHint.textContent = 'C — NEXT CAM · ESC — EXIT FEED';
+
+  // --- v6: adrenaline vignette -------------------------------------------------------
+  const adrenVig = _el('div', 'ec3-adren', document.body);
+
   // --- v3: anger flash + note prompt --------------------------------------------
   const anger = _el('div', 'ec3-hud ec3-anger', document.body);
   anger.textContent = 'IT IS ANGRIER';
   const notePrompt = _el('div', 'ec3-hud ec3-noteprompt', document.body);
-  notePrompt.textContent = 'F — READ NOTE';
+  notePrompt.textContent = 'E — READ';
 
   // --- v3: note readout overlay ---------------------------------------------------
   const noteOv = _el('div', 'ec3-noteov', document.body);
@@ -5412,7 +6410,7 @@ function buildHUD() {
   const noteTitle = _el('div', 'ec3-notetitle', noteCard);
   const noteBody = _el('div', 'ec3-notebody', noteCard);
   const noteHint = _el('div', 'ec3-notehint', noteCard);
-  noteHint.textContent = 'F / ESC — CLOSE';
+  noteHint.textContent = 'E / ESC — CLOSE';
 
   // --- v3: intro fade + PA subtitle -------------------------------------------------
   const introFade = _el('div', 'ec3-introfade', document.body);
@@ -5451,10 +6449,13 @@ function buildHUD() {
   const df = _el('div', 'ec3-diff', d);
   df.id = 'ec3-diffrow';
   const tc2 = _el('div', 'ec3-ctrl', d);
-  tc2.innerHTML = 'WASD — move · SHIFT — move quietly · C — crouch<br>' +
+  tc2.innerHTML = 'WASD — move · SHIFT — move quietly · Z — crouch<br>' +
     'SPACE — sonar pulse (it reveals… but it hears)<br>' +
-    'Q — throw lure · E — drop radio · M — map · N — mute<br>' +
+    'F — flashlight · Q — throw lure · G — drop radio · E — read<br>' +
+    'C — security cameras · X — adrenaline · M — map · N — mute<br>' +
     '<span style="color:#5a6b7a">←/→ — difficulty · ENTER — begin</span>';
+  const bt = _el('div', 'ec3-note', d);
+  bt.id = 'ec3-bestline';
   _el('div', 'ec3-note', d).textContent = 'Headphones recommended.';
 
   // HOWTO: field protocol.
@@ -5465,9 +6466,12 @@ function buildHUD() {
     '1 · <span class="ec3-ice">SONAR IS SIGHT</span> — every pulse maps the lab,<br>' +
     '<span class="ec3-red">but the specimen hears it too.</span><br><br>' +
     '2 · <span class="ec3-amber">STAND STILL TO HIDE.</span> Move quietly (SHIFT) near it.<br>' +
-    'Throw lures (Q) · drop radios (E) to pull it away.<br><br>' +
-    '3 · Recover <span class="ec3-amber">3 KEYCARDS</span>, then reach the <span class="ec3-amber">EXIT</span>.<br>' +
-    'Do not let it touch you.';
+    'Throw lures (Q) · drop radios (G) to pull it away.<br><br>' +
+    '3 · <span class="ec3-amber">FLASHLIGHT (F)</span> burns battery — and it can SEE the beam.<br>' +
+    'Watch it on the <span class="ec3-ice">SECURITY CAMS (C)</span> from the monitor room.<br><br>' +
+    '4 · Recover <span class="ec3-amber">3 KEYCARDS</span>, then reach <span class="ec3-amber">ANY EXIT</span>:<br>' +
+    'MAIN (east) · VENT (north, security) · SERVICE (south, long but quiet).<br>' +
+    '<span class="ec3-ice">ADRENALINE (X)</span> buys 10 seconds of speed. Do not let it touch you.';
   const he = _el('div', 'ec3-enter', d); he.textContent = 'ENTER — BEGIN';
   he.style.marginTop = '30px';
 
@@ -5498,20 +6502,25 @@ function buildHUD() {
 
   _hud = {
     diamonds: diamonds, objLine: objLine,
+    timerLine: timerLine, logLine: logLine,
     sweepWrap: sweepWrap, sweepRing: sweepRing, sweepCenter: sweepCenter,
-    throwN: throwN, radioN: radioN,
+    throwN: throwN, radioN: radioN, syrN: syrN,
     tut: tut, dreadBox: dreadBox, bands: bands,
     heard: heard, mute: mute, edgeVig: edgeVig,
     screens: screens,
-    stamFill: stamFill, anger: anger, notePrompt: notePrompt,
+    stamFill: stamFill, battFill: battFill,
+    anger: anger, notePrompt: notePrompt,
     noteOv: noteOv, noteTitle: noteTitle, noteBody: noteBody,
     introFade: introFade, paSub: paSub,
     mapOv: mapOv, mapCanvas: mapCanvas,
-    _last: { keys: -1, obj: '', cd: -1, th: -1, ra: -1, tut: '\u0000', bands: -1, heard: null, mute: null, vig: -1,
-             stam: -1, anger: null, notep: null }
+    camOv: camOv, camLabel: camLabel, adrenVig: adrenVig,
+    _last: { keys: -1, obj: '', cd: -1, th: -1, ra: -1, sy: -1, tut: '\u0000', bands: -1, heard: null, mute: null, vig: -1,
+             stam: -1, batt: -1, anger: null, notep: null, timer: '', logs: '', adren: -1 }
   };
   // v5: paint the initial difficulty row (NORMAL).
   if (typeof refreshDiffUI === 'function') refreshDiffUI();
+  // v6: paint the stored speedrun bests.
+  if (typeof refreshBestUI === 'function') refreshBestUI();
 }
 
 // v5: difficulty selector readout (TITLE screen). Called by buildHUD once
@@ -5529,6 +6538,43 @@ function refreshDiffUI() {
     '<span class="ec3-amber">' + D.id + '</span> ' +
     '<span class="ec3-dim">▶</span><br>' +
     '<span class="ec3-diffdesc">' + D.tag + ' — ' + D.desc + '</span>';
+}
+
+// v6: best speedrun times on the TITLE screen (one slot per difficulty).
+function refreshBestUI() {
+  var el = document.getElementById('ec3-bestline');
+  if (!el) return;
+  var parts = [];
+  var ids = (typeof DIFFS !== 'undefined') ? DIFFS.map(function (d) { return d.id; }) : ['EASY', 'NORMAL', 'HARD'];
+  for (var i = 0; i < ids.length; i++) {
+    var v = 0;
+    try {
+      if (typeof localStorage !== 'undefined') v = parseFloat(localStorage.getItem('ec3best_' + ids[i])) || 0;
+    } catch (e) { v = 0; }
+    parts.push(ids[i] + ' ' + (v > 0 ? _fmtTimeMs(v) : '--:--.---'));
+  }
+  el.textContent = 'BEST TIMES — ' + parts.join(' · ');
+}
+
+// v6: millisecond time formatter for the speedrun clock (MM:SS.mmm).
+function _fmtTimeMs(sec) {
+  var s = Math.max(0, sec);
+  var m = Math.floor(s / 60);
+  var r = Math.floor(s % 60);
+  var ms = Math.floor((s * 1000) % 1000);
+  function _p(n, l) { n = String(n); while (n.length < l) n = '0' + n; return n; }
+  return _p(m, 2) + ':' + _p(r, 2) + '.' + _p(ms, 3);
+}
+
+// v6: CCTV overlay show/hide (world.js input drives these).
+function showCam(i) {
+  if (!_hud) return;
+  _hud.camLabel.textContent = 'CAM 0' + (i + 1) + ' // LIVE';
+  _hud.camOv.classList.add('on');
+}
+function hideCam() {
+  if (!_hud) return;
+  _hud.camOv.classList.remove('on');
 }
 
 // Refresh every HUD element from G. Cheap: only writes the DOM when a value
@@ -5549,9 +6595,13 @@ function updateHUD() {
     }
   }
 
-  // Objective line (top-center, small caps): keycards found, or the exit.
-  const objTxt = G.exit && G.exit.open
-    ? 'REACH THE <span class="dim">EXIT</span>'
+  // Objective line (top-center, small caps): keycards found, or the exits.
+  var _anyOpen = false;
+  for (var _eo = 0; _eo < G.exits.length; _eo++) {
+    if (G.exits[_eo].open) { _anyOpen = true; break; }
+  }
+  const objTxt = _anyOpen
+    ? 'REACH AN <span class="dim">EXIT</span>'
     : 'FIND KEYCARDS <span class="dim">' + G.keys + '/3</span>';
   if (objTxt !== L.obj) {
     L.obj = objTxt;
@@ -5576,6 +6626,25 @@ function updateHUD() {
   if (G.radiosLeft !== L.ra) {
     L.ra = G.radiosLeft;
     _hud.radioN.textContent = '×' + G.radiosLeft;
+  }
+  // v6: adrenaline syringes carried.
+  if (G.shots !== L.sy) {
+    L.sy = G.shots;
+    _hud.syrN.textContent = '×' + G.shots;
+  }
+
+  // v6: speedrun timer (top-center) + audio-log counter.
+  const timerTxt = inPlay ? _fmtTimeMs(G.speedT || 0) : '';
+  if (timerTxt !== L.timer) {
+    L.timer = timerTxt;
+    _hud.timerLine.textContent = timerTxt;
+  }
+  var _nl = 0;
+  if (G.logsRead) for (var _li = 0; _li < G.logsRead.length; _li++) if (G.logsRead[_li]) _nl++;
+  const logTxt = inPlay && (typeof AUDIO_LOGS !== 'undefined') ? 'LOGS ' + _nl + '/' + AUDIO_LOGS.length : '';
+  if (logTxt !== L.logs) {
+    L.logs = logTxt;
+    _hud.logLine.textContent = logTxt;
   }
 
   // Tutorial line.
@@ -5622,6 +6691,22 @@ function updateHUD() {
     _hud.stamFill.style.background = stamPct < C.PANT_BELOW ? '#C0392B' : '#7FD4E8';
   }
 
+  // v6: flashlight battery (amber bar). Red when nearly dead.
+  const battPct = Math.round((G.batt || 0));
+  if (battPct !== L.batt) {
+    L.batt = battPct;
+    _hud.battFill.style.width = battPct + '%';
+    _hud.battFill.style.background = battPct < 25 ? '#C0392B' : '#F5A524';
+  }
+
+  // v6: adrenaline vignette — cyan edge pulse while the shot burns.
+  const adrenOn = inPlay && G.shotFxT > 0;
+  const adrenPct = adrenOn ? Math.round(50 + 50 * Math.sin(G.time * 6)) : 0;
+  if (adrenPct !== L.adren) {
+    L.adren = adrenPct;
+    _hud.adrenVig.style.opacity = (adrenPct / 100 * 0.8).toFixed(2);
+  }
+
   // v3: anger flash on keycard pickup ("IT IS ANGRIER").
   if (G.angerFlash > 0) G.angerFlash -= 1 / 60;
   const angerOn = inPlay && G.angerFlash > 0;
@@ -5631,7 +6716,8 @@ function updateHUD() {
   }
 
   // v3: note prompt when a readable note is in range.
-  const noteP = inPlay && G.nearNote >= 0 && G.noteOpen < 0;
+  // v6: also fires for audio logs (E reads both).
+  const noteP = inPlay && G.noteOpen < 0 && (G.nearNote >= 0 || G.nearLog >= 0);
   if (noteP !== L.notep) {
     L.notep = noteP;
     _hud.notePrompt.style.display = noteP ? 'block' : 'none';
@@ -5659,6 +6745,8 @@ function showScreen(name) {
   for (let i = 0; i < names.length; i++) {
     _hud.screens[names[i]].classList.toggle('on', names[i] === name);
   }
+  // v6: TITLE shows the stored speedrun bests (they change after a win).
+  if (name === 'TITLE' && typeof refreshBestUI === 'function') refreshBestUI();
 }
 
 // v3: lab note readout overlay (phosphor terminal style).
@@ -5689,9 +6777,11 @@ function hideMap() {
 function _drawMap() {
   if (!_hud || !G.visited) return;
   var cv = _hud.mapCanvas, g = cv.getContext('2d');
-  var W = C.W, H = C.H, TS = 34;
+  var W = C.W, H = C.H;
+  // v6: tile size adapts to the expanded map (19x14).
+  var TS = Math.max(10, Math.min(34, Math.floor(Math.min(640 / W, 450 / H))));
   var ox = Math.floor((cv.width - W * TS) / 2);
-  var oy = Math.floor((cv.height - H * TS) / 2) + 8;
+  var oy = Math.floor((cv.height - H * TS) / 2) + 4;
   // backdrop
   g.fillStyle = '#0B1220';
   g.fillRect(0, 0, cv.width, cv.height);
@@ -5724,10 +6814,12 @@ function _drawMap() {
   // pass 3: grid ticks on visited area
   g.strokeStyle = 'rgba(127,212,232,0.08)';
   g.lineWidth = 1;
-  // room labels (only where the player has been)
+  // room labels (only where the player has been). v6: SECURITY added.
   var labels = [
     { t: 'LAB 7', x: 2, y: 1 }, { t: 'CONTAINMENT', x: 9, y: 3 },
-    { t: 'STORAGE', x: 3, y: 8 }, { t: 'AIRLOCK', x: 12, y: 6 }
+    { t: 'STORAGE', x: 3, y: 8 }, { t: 'AIRLOCK', x: 12, y: 6 },
+    { t: 'SECURITY', x: 16, y: 3 }, { t: 'SERVICE', x: 10, y: 12 },
+    { t: 'EAST WING', x: 16, y: 7 }
   ];
   g.font = '10px "Courier New", monospace';
   g.textAlign = 'center';
@@ -5736,6 +6828,18 @@ function _drawMap() {
     if (!vis(lb.x, lb.y)) continue;
     g.fillStyle = 'rgba(138,147,155,0.55)';
     g.fillText(lb.t, ox + lb.x * TS + TS / 2, oy + lb.y * TS + TS / 2 + 3);
+  }
+  // v6: CCTV cameras — small cyan squares (positions are fixed intel).
+  if (typeof CAMS !== 'undefined') {
+    for (var ci = 0; ci < CAMS.length; ci++) {
+      if (!vis(CAMS[ci].x, CAMS[ci].y)) continue;
+      var cxp = ox + CAMS[ci].x * TS + TS / 2, cyp = oy + CAMS[ci].y * TS + TS / 2;
+      g.fillStyle = 'rgba(127,212,232,0.85)';
+      g.fillRect(cxp - 4, cyp - 4, 8, 8);
+      g.fillStyle = '#05070A';
+      g.font = 'bold 8px "Courier New", monospace';
+      g.fillText(String(ci + 1), cxp, cyp + 3);
+    }
   }
   // keycards: amber diamonds (seen only; taken = dim tick)
   for (var ki = 0; ki < G.keycards.length; ki++) {
@@ -5756,15 +6860,26 @@ function _drawMap() {
       g.fillText(String(ki + 1), kx, ky + 4);
     }
   }
-  // exit: green door (seen only)
-  if (G.seenExit) {
-    var ex = ox + G.exit.x * TS + TS / 2, ey = oy + G.exit.y * TS + TS / 2;
-    g.strokeStyle = G.exit.open ? '#7dff9a' : '#3ddc68';
+  // v6: exits — green doors (seen only), labeled by id.
+  for (var ei = 0; ei < G.exits.length; ei++) {
+    var exi = G.exits[ei];
+    if (!G.seenExit[ei]) continue;
+    var ex = ox + exi.x * TS + TS / 2, ey = oy + exi.y * TS + TS / 2;
+    g.strokeStyle = exi.open ? '#7dff9a' : '#3ddc68';
     g.lineWidth = 2;
     g.strokeRect(ex - 11, ey - 11, 22, 22);
-    g.fillStyle = G.exit.open ? '#7dff9a' : '#3ddc68';
+    g.fillStyle = exi.open ? '#7dff9a' : '#3ddc68';
     g.font = '9px "Courier New", monospace';
-    g.fillText(G.exit.open ? 'OPEN' : 'EXIT', ex, ey + 24);
+    g.fillText(exi.open ? 'OPEN' : exi.id, ex, ey + 24);
+  }
+  // v6: audio logs — amber cassette ticks (seen only; read = dim).
+  if (typeof AUDIO_LOGS !== 'undefined') {
+    for (var gi = 0; gi < AUDIO_LOGS.length; gi++) {
+      if (!G.seenLog[gi]) continue;
+      var gx = ox + AUDIO_LOGS[gi].x * TS + TS / 2, gy = oy + AUDIO_LOGS[gi].y * TS + TS / 2;
+      g.fillStyle = (G.logsRead && G.logsRead[gi]) ? 'rgba(245,165,36,0.25)' : '#F5A524';
+      g.fillRect(gx - 5, gy - 3, 10, 6);
+    }
   }
   // last-known creature ping: fading red "?" (never live-tracked)
   if (G.pingMark) {
@@ -5797,7 +6912,7 @@ function _drawMap() {
   g.fillStyle = 'rgba(232,228,216,0.6)';
   g.font = '10px "Courier New", monospace';
   g.textAlign = 'left';
-  g.fillText('◆ KEYCARD    ▭ EXIT    ? LAST PING    ▲ YOU', ox + 6, oy + H * TS + 22);
+  g.fillText('◆ KEYCARD   ▭ EXIT   ▫ CAM   ▬ LOG   ? LAST PING   ▲ YOU', ox + 6, oy + H * TS + 18);
 }
 
 // v3: intro sequence HUD — fade from black, PA subtitle.
@@ -5837,8 +6952,12 @@ function updateScreens() {
   const s = G.state;
   if (s === 'WIN' && _screenName !== 'WIN') {
     const st = _hud.screens.WIN.querySelector('.ec3-stats');
-    const secs = _fmtTime(G.totalTime > 0 ? G.totalTime : G.time);
+    const secs = _fmtTimeMs(G.speedT > 0 ? G.speedT : G.time);
+    const exitName = G.exitUsed || 'MAIN';
     st.innerHTML = 'TIME&nbsp;&nbsp;' + secs +
+      (G.newBest ? '<br><span class="ec3-amber">NEW BEST — ' + G.difficulty + '</span>'
+                 : (G.bestT > 0 ? '<br>BEST&nbsp;&nbsp;' + _fmtTimeMs(G.bestT) + ' (' + G.difficulty + ')' : '')) +
+      '<br>EXIT&nbsp;&nbsp;' + exitName +
       '<br>KEYCARDS&nbsp;&nbsp;' + G.keys + '/3' +
       '<br>SONAR PULSES&nbsp;&nbsp;' + G.pulsesUsed +
       '<br>DISTRACTIONS&nbsp;&nbsp;' + ((G.throwsUsed || 0) + (G.radiosUsed || 0)) +
@@ -5872,21 +6991,39 @@ function updateScreens() {
 
 function _playStep3D(dt) {
   G.time += dt;
+  // v6: speedrun clock — runs from the moment PLAY begins until WIN.
+  if (G.state === 'PLAY') G.speedT += dt;
   if (G.pulseCd > 0) G.pulseCd = Math.max(0, G.pulseCd - dt);
   if (G.heardFlash > 0) G.heardFlash = Math.max(0, G.heardFlash - dt);
+  // v6: adrenaline effect + cooldown timers.
+  if (G.shotFxT > 0) G.shotFxT = Math.max(0, G.shotFxT - dt);
+  if (G.shotCdT > 0) G.shotCdT = Math.max(0, G.shotCdT - dt);
   // v5: action-key lock decay (anti-misfire after PLAY transitions).
   if (G.inputLockT > 0) G.inputLockT = Math.max(0, G.inputLockT - dt);
   // v3: reading a note freezes the sim (the overlay has the player's eyes).
   if (G.noteOpen >= 0) return;
   // v4: tactical map open freezes the sim too.
   if (G.mapOpen) return;
+  // v6: CCTV view — the player stands frozen at the monitors, but the
+  // specimen keeps hunting. Watching is safe until it isn't.
+  var _camMode = G.camOpen >= 0;
   // Freeze player input during the TAKEN death cinematic (creature.js owns the
   // 1.2s timeline via Creature.beginTaken()); everything else keeps ticking.
-  if (!(typeof Creature !== 'undefined' && Creature.takenActive && Creature.takenActive())) updatePlayer3D(dt);
+  if (!(typeof Creature !== 'undefined' && Creature.takenActive && Creature.takenActive()) && !_camMode) updatePlayer3D(dt);
   updateRadios(dt);
   updateCreature(dt);
   if (typeof updateMapIntel === 'function') updateMapIntel();
   if (typeof syncCreatureMesh === 'function') syncCreatureMesh(dt);
+  // v6: the specimen sees the flashlight beam — light inside its vision
+  // range with line-of-sight feeds suspicion while the torch is lit.
+  if (G.torchOn && G.batt > 0 && G.camOpen < 0 && typeof hasLOS === 'function') {
+    var _pc = G.creature;
+    var _pd = Math.hypot(G.player.x - _pc.x, G.player.y - _pc.y);
+    if (_pd <= C.TORCH_SEE_R &&
+        hasLOS(Math.floor(_pc.x), Math.floor(_pc.y), Math.floor(G.player.x), Math.floor(G.player.y))) {
+      _pc.susp = Math.min(C.SUSP_MAX, _pc.susp + C.TORCH_SEE_SUSP * dt);
+    }
+  }
   checkCapture3D();
   Tut.update(dt);
   Sfx.frame(dt);
@@ -5927,6 +7064,7 @@ function gameLoop3D(ts) {
   }
   if (typeof requestAnimationFrame === 'function') requestAnimationFrame(gameLoop3D);
 })();
+
 </script>
 </body>
 </html>
