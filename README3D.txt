@@ -23,7 +23,9 @@ F ................ flashlight on/off (drains battery ~3 min; recharges off)
                    WARNING: the specimen can SEE the beam — light feeds it
 Q / click ........ throw a distraction 4 tiles ahead (3 total)
 G ................ drop a radio lure (2 total, ticks for 12s)
-E (near note) .... read lab notes + recovered audio logs
+E (near note) .... read lab notes
+E (near log) ..... PLAY voice recording (AI-generated voice log)
+                   E again / TAB = text transcript, ESC = stop
 C ................ security camera view (cycles 5 cams, ESC exits)
                    you see IT live — but you stand still while watching
 X ................ inject adrenaline (10s +40% speed, no stamina drain;
@@ -98,3 +100,20 @@ black. (And sometimes you hear a DISTANT scream that means nothing. Probably.)
 Audio is fully positional (HRTF): the creature has a distinct voice per AI state,
 the sonar ping's reverb tail changes between corridors and rooms, and the heartbeat
 enters panic mode when it gets close. HUD is a phosphor-terminal lab instrument.
+
+v7 — HORROR OVERHAUL (2026-10-16)
+---------------------------------
+Per Tim's feedback ("jumpscare is shit, game isn't scary while playing"):
+
+VOICE AUDIO LOGS: The 5 cassettes now PLAY AI-generated voice recordings
+(Dr. Sharma, Vikram, security guard) with a static-crackle "damaged tape"
+bed. E plays, E again/TAB shows transcript, ESC stops, walking away stops.
+
+ATMOSPHERIC DREAD (while playing, not just at death):
+- Always-on dread drone (detuned saws) that SWELLS as the creature nears
+- Heartbeat 1.0s -> 0.35s interval within 8 tiles; red vignette to 0.45
+- Breathing radar: 10-tile directional audio — hear WHERE it is
+- Random ambient scares (45-90s): distant clangs, whispers, light flickers
+
+JUMPSCARE TUNED: longer dread silence (0.8s), 3 randomized face variants
+with bigger eyes/wider mouth, 5th scream layer (3000Hz shriek), violent shake.
