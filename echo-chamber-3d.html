@@ -37,8 +37,8 @@ const C = {
   Q_SPEED: 2.4,                     // tiles/sec quiet (Shift)
   P_NOISE_R: 3, Q_NOISE_R: 1,       // noise radius per tile entered
   P_SUSP: 12, Q_SUSP: 4,            // suspicion per step
-  C_ROAM_SPD: 1.8, C_INV_SPD: 3.0, C_HUNT_SPD: 3.85,   // tiles/sec
-  C_TICK_ROAM: 0.55, C_TICK_INV: 0.33, C_TICK_HUNT: 0.26, // seconds per creature step
+  C_ROAM_SPD: 1.8, C_INV_SPD: 3.0, C_HUNT_SPD: 3.03,   // tiles/sec (v4: HUNT -21% per playtest)
+  C_TICK_ROAM: 0.55, C_TICK_INV: 0.33, C_TICK_HUNT: 0.33, // seconds per creature step
   VISION_R: 2,                      // creature vision (Bresenham LOS)
   CAPTURE_D: 0.6,                   // tiles — capture distance
   SUSP_MAX: 100, SUSP_DECAY: 8, SUSP_DECAY_HIDDEN: 20, // per second
@@ -99,6 +99,12 @@ const G = {
   nearNote: -1,              // index of readable note in range, -1 none
   noteOpen: -1,              // index of open note overlay, -1 none
   angerFlash: 0,             // "IT IS ANGRIER" HUD timer on keycard pickup
+  // --- v4 map state ---
+  mapOpen: false,            // tactical map overlay open (sim frozen, like notes)
+  visited: null,             // Uint8Array(W*H): 1 = player has stood here (fog of war)
+  seenKC: [false,false,false], // keycard intel: seen via sonar/proximity
+  seenExit: false,           // exit intel: seen via sonar/proximity
+  pingMark: null,            // last-known creature {x,y,rt} from a sonar ping (real-time fade)
 };
 G.reveal = new Float32Array(C.W * C.H);
 G.reveal.fill(-1e3);         // unrevealed sentinel (avoids a full-map flash at t=0)
@@ -536,7 +542,40 @@ function _texTape() {
   g.fillText('QUARANTINE', 256, 34);
   return _finishTex(c);
 }
-// Blood smear: one restrained decal near the chamber (not gallons).
+// v4: green EXIT sign (emergency, glowing).
+function _texExitSign() {
+  var c = _newCanvas(256, 96), g = c.getContext('2d');
+  g.fillStyle = '#1E7B3C'; g.fillRect(0, 0, 256, 96);
+  g.fillStyle = '#EDEDED';
+  g.font = 'bold 52px monospace';
+  g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText('EXIT', 150, 50);
+  // running-man suggestion: white figure
+  g.fillRect(28, 30, 18, 26);           // torso
+  g.beginPath(); g.arc(37, 20, 9, 0, 7); g.fill(); // head
+  g.fillRect(14, 34, 14, 7);            // arm
+  g.fillRect(22, 56, 8, 22);            // leg fwd
+  g.fillRect(38, 56, 8, 18);            // leg back
+  return _finishTex(c);
+}
+// v4: wall clock — hands stopped at an odd time (abandoned-lab staple).
+function _texClock() {
+  var c = _newCanvas(128, 128), g = c.getContext('2d');
+  g.fillStyle = '#101216'; g.fillRect(0, 0, 128, 128);
+  g.fillStyle = '#EDEDED';
+  g.beginPath(); g.arc(64, 64, 54, 0, 7); g.fill();
+  g.fillStyle = '#101216';
+  for (var i = 0; i < 12; i++) {
+    var a = i * Math.PI / 6;
+    g.fillRect(64 + Math.cos(a) * 46 - 2, 64 + Math.sin(a) * 46 - 2, 4, 4);
+  }
+  g.strokeStyle = '#101216'; g.lineCap = 'round';
+  g.lineWidth = 6; g.beginPath(); g.moveTo(64, 64);
+  g.lineTo(64 + Math.cos(-1.9) * 28, 64 + Math.sin(-1.9) * 28); g.stroke(); // hour
+  g.lineWidth = 4; g.beginPath(); g.moveTo(64, 64);
+  g.lineTo(64 + Math.cos(0.7) * 42, 64 + Math.sin(0.7) * 42); g.stroke();   // minute
+  return _finishTex(c);
+}
 function _texBlood() {
   var c = _newCanvas(64, 64), g = c.getContext('2d');
   g.clearRect(0, 0, 64, 64);
@@ -561,6 +600,13 @@ function _buildLabTextures() {
   _tex.signLab7 = _texSign('LAB 7 \u2014 AUTHORIZED PERSONNEL', 30);
   _tex.tape = _texTape();
   _tex.blood = _texBlood();
+  // v4: emergency + lab realism signage
+  _tex.exitSign = _texExitSign();
+  _tex.clock = _texClock();
+  _tex.signHood = _texSign('FUME HOOD \u2014 SASH AT 18 IN', 26);
+  _tex.signEyewash = _texSign('EMERGENCY EYEWASH', 30);
+  _tex.signShower = _texSign('SAFETY SHOWER', 30);
+  _tex.signBio = _texSign('CAUTION \u2014 BIOHAZARD', 28);
 }
 
 // ============================================= lab prop / lighting build
@@ -692,11 +738,204 @@ function _buildLabVisuals() {
   _buildPapers(add, geo);
   _buildSignage(add, geo, mat);
   _buildExitFrame(add, geo, mat);
+  _buildLabV4(add, geo, mat);   // v4: fume hoods, safety gear, ceiling, hero props
   _buildDust();
   _buildBurst();
 
   _labBuilt = true;
   _updateRoomLights();
+}
+
+// v4: laboratory realism upgrade — the props that make it read as a REAL lab.
+// All wall-hugging (offset toward an adjacent wall) so tile centers stay
+// walkable; no collision (visual only, like the existing benches).
+function _buildLabV4(add, geo, mat) {
+  var g = new THREE.Group();
+  // New shared materials.
+  var yellowMat = mat(new THREE.MeshLambertMaterial({ color: 0xE8B400 })); // safety yellow
+  var greenMat = mat(new THREE.MeshLambertMaterial({ color: 0x2F7D4F }));  // eyewash green
+  var hoodMat = mat(new THREE.MeshLambertMaterial({ color: 0xE4E6E2 }));   // fume hood white
+  var sashMat = mat(new THREE.MeshLambertMaterial({ color: 0x2E3D47 }));   // sash glass
+  var orangeMat = mat(new THREE.MeshLambertMaterial({ color: 0xC96A2B })); // glove box
+  var tealMat = mat(new THREE.MeshLambertMaterial({ color: 0x2E6E5E }));   // O2 cylinder
+  var greyMat = mat(new THREE.MeshLambertMaterial({ color: 0x6E7478 }));   // N2 cylinder
+  var exitGlowMat = mat(new THREE.MeshBasicMaterial({ map: _tex.exitSign }));
+  var clockMat = mat(new THREE.MeshBasicMaterial({ map: _tex.clock }));
+  var signHoodMat = mat(new THREE.MeshBasicMaterial({ map: _tex.signHood }));
+  var signEyeMat = mat(new THREE.MeshBasicMaterial({ map: _tex.signEyewash }));
+  var signShowerMat = mat(new THREE.MeshBasicMaterial({ map: _tex.signShower }));
+
+  function box(w, h, d, m, x, y, z, ry) {
+    var ms = new THREE.Mesh(geo(new THREE.BoxGeometry(w, h, d)), m);
+    ms.position.set(x, y, z);
+    if (ry) ms.rotation.y = ry;
+    g.add(ms);
+    return ms;
+  }
+  function cyl(rt, rb, h, m, x, y, z, seg) {
+    var ms = new THREE.Mesh(geo(new THREE.CylinderGeometry(rt, rb, h, seg || 10)), m);
+    ms.position.set(x, y, z);
+    g.add(ms);
+    return ms;
+  }
+  function wallSign(m2, w, h, x, y, z, ry) {
+    var ms = new THREE.Mesh(geo(new THREE.PlaneGeometry(w, h)), m2);
+    ms.position.set(x, y, z);
+    ms.rotation.y = ry || 0;
+    g.add(ms);
+    return ms;
+  }
+
+  // ---- ceiling: acoustic tile grid (enclosure — the maze becomes rooms) ----
+  var ceil = new THREE.Mesh(geo(new THREE.PlaneGeometry(60, 44)),
+    mat(new THREE.MeshLambertMaterial({ map: _tex.ceil })));
+  ceil.rotation.x = Math.PI / 2; // face down
+  ceil.position.set(30, 3.42, 22);
+  g.add(ceil);
+
+  // ---- fume hoods (2): tall white cabinets with dark sash windows --------
+  function fumeHood(tx, ty, dirZ, flip) {
+    var c = worldFromTile(tx, ty);
+    var hx = c.x, hz = c.z + dirZ * 1.35;
+    box(1.8, 2.4, 0.9, hoodMat, hx, 1.2, hz);                    // body
+    box(1.6, 0.9, 0.06, sashMat, hx, 1.35, hz - dirZ * 0.46);    // sash glass
+    box(1.7, 0.08, 0.95, _labDarkMat, hx, 0.95, hz);             // worktop
+    var duct = cyl(0.16, 0.16, 1.0, _labSteelMat, hx, 2.9, hz);  // duct to ceiling
+    void duct;
+    // beakers inside
+    cyl(0.07, 0.09, 0.16, sashMat, hx - 0.4, 1.07, hz - dirZ * 0.1);
+    cyl(0.06, 0.08, 0.14, sashMat, hx + 0.35, 1.06, hz - dirZ * 0.15);
+    // placard
+    wallSign(signHoodMat, 1.1, 0.21, hx, 2.05, hz - dirZ * 0.46, flip ? Math.PI : 0);
+  }
+  fumeHood(12, 3, -1, false);  // north wall
+  fumeHood(8, 3, 1, true);     // south wall
+
+  // ---- safety shower (yellow) at (1,6), west wall -------------------------
+  (function () {
+    var c = worldFromTile(1, 6), sx = c.x - 1.45, sz = c.z;
+    cyl(0.05, 0.05, 2.3, yellowMat, sx, 1.15, sz);               // vertical pipe
+    var arm = cyl(0.04, 0.04, 0.7, yellowMat, sx + 0.3, 2.28, sz);
+    arm.rotation.z = Math.PI / 2;                                 // horizontal arm
+    cyl(0.14, 0.05, 0.12, yellowMat, sx + 0.62, 2.2, sz);        // shower head
+    box(0.12, 0.18, 0.04, yellowMat, sx, 1.5, sz + 0.08);        // pull handle
+    // floor drain + stripe ring
+    var drain = new THREE.Mesh(geo(new THREE.CircleGeometry(0.3, 16)),
+      mat(new THREE.MeshBasicMaterial({ color: 0x101216 })));
+    drain.rotation.x = -Math.PI / 2; drain.position.set(sx + 0.62, 0.013, sz);
+    g.add(drain);
+    wallSign(signShowerMat, 1.5, 0.28, c.x - 1.96, 2.1, sz, Math.PI / 2);
+  })();
+
+  // ---- eyewash station (green) at (1,8), west wall -------------------------
+  (function () {
+    var c = worldFromTile(1, 8), ex = c.x - 1.45, ez = c.z;
+    cyl(0.06, 0.08, 0.9, greenMat, ex, 0.45, ez);               // pedestal
+    cyl(0.22, 0.16, 0.14, greenMat, ex, 0.95, ez);              // basin
+    cyl(0.025, 0.025, 0.10, _labSteelMat, ex - 0.07, 1.04, ez);  // nozzles
+    cyl(0.025, 0.025, 0.10, _labSteelMat, ex + 0.07, 1.04, ez);
+    wallSign(signEyeMat, 1.5, 0.28, c.x - 1.96, 1.9, ez, Math.PI / 2);
+  })();
+
+  // ---- gas cylinders (teal O2 + grey N2) at (6,1), north wall --------------
+  (function () {
+    var c = worldFromTile(6, 1), gz = c.z - 1.45;
+    cyl(0.16, 0.16, 1.4, tealMat, c.x - 0.3, 0.7, gz);
+    cyl(0.16, 0.16, 1.4, greyMat, c.x + 0.3, 0.7, gz);
+    cyl(0.04, 0.04, 0.12, _labDarkMat, c.x - 0.3, 1.46, gz);     // valves
+    cyl(0.04, 0.04, 0.12, _labDarkMat, c.x + 0.3, 1.46, gz);
+    box(1.1, 0.05, 0.05, _labDarkMat, c.x, 1.1, gz - 0.17);      // chain bar
+  })();
+
+  // ---- wall clock (stopped) on wall (10,2), south face ---------------------
+  wallSign(clockMat, 0.55, 0.55, 42, 2.4, 11.94, 0);
+
+  // ---- tipped office chairs (2): (5,4) and (11,7) ---------------------------
+  function tippedChair(tx, ty, ry) {
+    var c = worldFromTile(tx, ty);
+    var ch = new THREE.Group();
+    var seatM = mat(new THREE.MeshLambertMaterial({ color: 0x2B3A55 }));
+    var seat = new THREE.Mesh(geo(new THREE.BoxGeometry(0.45, 0.06, 0.45)), seatM);
+    ch.add(seat);
+    var back = new THREE.Mesh(geo(new THREE.BoxGeometry(0.45, 0.5, 0.06)), seatM);
+    back.position.set(0, 0.28, -0.22); ch.add(back);
+    var stem = new THREE.Mesh(geo(new THREE.CylinderGeometry(0.03, 0.03, 0.4, 8)), _labDarkMat);
+    stem.position.y = -0.23; ch.add(stem);
+    ch.position.set(c.x, 0.26, c.z);
+    ch.rotation.set(0.2, ry, Math.PI / 2 - 0.15); // on its side
+    g.add(ch);
+  }
+  tippedChair(5, 4, 0.7);
+  tippedChair(11, 7, 2.4);
+
+  // ---- glove box (orange hero prop) at (3,9), south wall --------------------
+  (function () {
+    var c = worldFromTile(3, 9), gx = c.x, gz = c.z + 1.35;
+    box(1.3, 0.75, 0.5, _labDarkMat, gx, 0.38, gz);              // stand
+    box(1.2, 0.8, 0.6, orangeMat, gx, 1.15, gz);                // body
+    var gl = new THREE.Mesh(geo(new THREE.PlaneGeometry(1.0, 0.55)),
+      mat(new THREE.MeshLambertMaterial({ color: 0xBFEFFF, transparent: true, opacity: 0.25 })));
+    gl.position.set(gx, 1.15, gz - 0.31); gl.rotation.y = Math.PI;
+    g.add(gl);
+    // glove ports: two rings with drooping gloves
+    for (var i = -1; i <= 1; i += 2) {
+      var ring = new THREE.Mesh(geo(new THREE.TorusGeometry(0.09, 0.02, 6, 12)), _labDarkMat);
+      ring.position.set(gx + i * 0.28, 1.15, gz - 0.31);
+      g.add(ring);
+      box(0.10, 0.22, 0.06, _labDarkMat, gx + i * 0.28, 1.02, gz - 0.28);
+    }
+  })();
+
+  // ---- biohazard bins (5,9): yellow, one tipped ------------------------------
+  (function () {
+    var c = worldFromTile(5, 9);
+    var binMat = mat(new THREE.MeshLambertMaterial({ color: 0xC9A227 }));
+    box(0.5, 0.7, 0.5, binMat, c.x - 1.2, 0.35, c.z + 1.2);
+    var tipped = box(0.5, 0.7, 0.5, binMat, c.x - 0.4, 0.25, c.z + 1.4);
+    tipped.rotation.z = Math.PI / 2 - 0.2;
+    // red bag spilling
+    var bag = new THREE.Mesh(geo(new THREE.SphereGeometry(0.22, 8, 6)),
+      mat(new THREE.MeshLambertMaterial({ color: 0xA62639 })));
+    bag.scale.set(1, 0.6, 1); bag.position.set(c.x + 0.15, 0.12, c.z + 1.45);
+    g.add(bag);
+  })();
+
+  // ---- fire extinguisher cabinet on wall (8,6), south face --------------------
+  (function () {
+    var fx = 34, fz = 27.94;
+    var cabMat = mat(new THREE.MeshLambertMaterial({ color: 0xB3231B }));
+    box(0.5, 0.7, 0.18, cabMat, fx, 1.3, fz);
+    cyl(0.09, 0.09, 0.45, cabMat, fx, 1.25, fz + 0.14);
+    cyl(0.02, 0.02, 0.25, _labDarkMat, fx + 0.08, 1.45, fz + 0.14);
+  })();
+
+  // ---- green EXIT signs: above the real exit + at spawn -----------------------
+  function exitSign(x, y, z, ry) {
+    var s = new THREE.Mesh(geo(new THREE.BoxGeometry(0.9, 0.34, 0.12)), _labDarkMat);
+    s.position.set(x, y, z); s.rotation.y = ry; g.add(s);
+    var f1 = new THREE.Mesh(geo(new THREE.PlaneGeometry(0.8, 0.28)), exitGlowMat);
+    f1.position.set(x, y, z); f1.rotation.y = ry;
+    f1.translateZ(0.065); g.add(f1);
+    var f2 = f1.clone(); f2.rotation.y = ry + Math.PI; f2.translateZ(-0.13); g.add(f2);
+  }
+  exitSign(54, 2.75, 26, Math.PI / 2);  // above the exit door (13,6)
+  exitSign(6, 2.75, 4.05, 0);           // spawn corridor (1,1), north wall
+
+  // ---- notice board on wall (13,7), west face ----------------------------------
+  (function () {
+    var bx = 51.94, bz = 30;
+    box(0.06, 1.0, 1.6, _labDarkMat, bx, 1.7, bz);
+    box(0.03, 0.9, 1.5, mat(new THREE.MeshLambertMaterial({ color: 0x8A6F4D })), bx - 0.02, 1.7, bz);
+    // pinned papers, one fallen
+    for (var i = 0; i < 4; i++) {
+      var pp = new THREE.Mesh(geo(new THREE.PlaneGeometry(0.22, 0.3)), _paperMat);
+      pp.position.set(bx - 0.045, 1.75 + (i % 2) * 0.25, bz - 0.5 + i * 0.33);
+      pp.rotation.y = -Math.PI / 2; pp.rotation.z = (i - 1.5) * 0.12;
+      g.add(pp);
+    }
+  })();
+
+  _labGroup.add(g);
 }
 
 // ---- containment chamber: glass box (opacity 0.15) on hazard-striped base,
@@ -1107,6 +1346,14 @@ function initLevel3D(keepKeys) {
   // v3 resets
   G.stamina = C.STAM_MAX; G.sprinting = false; G.pantT = 0;
   G.nearNote = -1; G.noteOpen = -1; G.angerFlash = 0;
+  // v4 map resets (intel persists across TAKEN retries? No — fresh run, fresh map.
+  // keycard TAKEN states persist via keepKeys, but intel is re-earned.)
+  G.mapOpen = false;
+  G.visited = new Uint8Array(C.W * C.H);
+  G.seenKC = [false, false, false];
+  G.seenExit = false;
+  G.pingMark = null;
+  if (typeof hideMap === 'function') hideMap();
   _sprintCode = null; _lastTapCode = null;
 
   // Lab run state: reset flicker/hunt/beat clocks (gotcha: stale timers
@@ -1164,6 +1411,10 @@ function _collidesAt(cx, cy, r) {
 // Shared "entered a new tile" logic: noise + step sfx + pickup + exit.
 function _onTileEnter(tx, ty) {
   var p = G.player;
+  // v4: fog-of-war — the player has stood here; the tactical map draws it.
+  if (G.visited && tx >= 0 && ty >= 0 && tx < C.W && ty < C.H) {
+    G.visited[ty * C.W + tx] = 1;
+  }
   var nr, ns;
   if (p.sprinting) { nr = C.SPRINT_NOISE_R; ns = C.SPRINT_SUSP; }
   else if (p.quiet) { nr = C.Q_NOISE_R; ns = C.Q_SUSP; }
@@ -1412,7 +1663,8 @@ document.addEventListener('keydown', function (e) {
       else if (G.state === 'WIN') { initLevel3D(false); G.state = 'PLAY'; }
       break;
     case 'Escape':
-      if (G.noteOpen >= 0) { _closeNote3D(); }
+      if (G.mapOpen) { _closeMap3D(); }
+      else if (G.noteOpen >= 0) { _closeNote3D(); }
       else if (G.state === 'PLAY') G.state = 'PAUSE';
       else if (G.state === 'PAUSE') G.state = 'PLAY';
       break;
@@ -1424,6 +1676,13 @@ document.addEventListener('keydown', function (e) {
       }
       break;
     case 'KeyM':
+      // v4: M opens the tactical map (was mute — mute moved to N).
+      if (G.state === 'PLAY') {
+        if (G.mapOpen) _closeMap3D();
+        else if (G.noteOpen < 0 && typeof openMap3D === 'function') openMap3D();
+      }
+      break;
+    case 'KeyN':
       if (typeof Sfx !== 'undefined' && Sfx.toggleMute) Sfx.toggleMute();
       break;
   }
@@ -1493,6 +1752,18 @@ function _finishIntro() {
 function _closeNote3D() {
   G.noteOpen = -1;
   if (typeof hideNote === 'function') hideNote();
+  if (typeof Sfx !== 'undefined' && Sfx.paper) Sfx.paper();
+}
+
+// v4: tactical map overlay helpers (audioui.js owns the DOM/canvas).
+function openMap3D() {
+  G.mapOpen = true;
+  if (typeof showMap === 'function') showMap();
+  if (typeof Sfx !== 'undefined' && Sfx.paper) Sfx.paper();
+}
+function _closeMap3D() {
+  G.mapOpen = false;
+  if (typeof hideMap === 'function') hideMap();
   if (typeof Sfx !== 'undefined' && Sfx.paper) Sfx.paper();
 }
 
@@ -1686,12 +1957,14 @@ function updateRadios(dt) {
 
 /* ---------------- creature FSM (ported from 2D ai.js) ---------------- */
 
-// v3: per-keycard escalation — each keycard makes the creature angrier.
-// G.keys: 0 (calm) .. 3 (furious). Hunt speed +8%/+15%/+22%, LOOK shortens,
-// SEARCH lengthens. Tuned so a competent player can still win.
+// v4: per-keycard escalation — each keycard makes the creature angrier.
+// G.keys: 0 (calm) .. 3 (furious). Hunt speed +6%/+12%/+18%, LOOK shortens,
+// SEARCH lengthens. v4 rebalance: base HUNT 3.03 t/s (tick 0.33, -21% from
+// 3.85) so player WALK (4.0) outpaces even max escalation (3.58); sprint
+// (5.6) is the guaranteed escape. The creature catches only the cornered.
 function _escHuntTick() {
   var k = Math.min(3, G.keys || 0);
-  var mult = [1, 1.08, 1.15, 1.22][k];
+  var mult = [1, 1.06, 1.12, 1.18][k];
   return C.C_TICK_HUNT / mult;
 }
 function _escLookT() {
@@ -1976,6 +2249,9 @@ var _cr = {
   // walk cycle
   walkPhase: 0, stepT: 0.5, stepSide: false,
   lastWX: 0, lastWZ: 0,         // group pos last frame (movement detect)
+  // v4: listening freeze + head lag
+  listenT: 3, listening: 0,     // countdown / active freeze timer
+  headLag: 0,                   // head counter-rotation lag
   // dust trace
   dustT: 0, lastTileX: -1, lastTileY: -1,
   // afterimages (hunt)
@@ -2025,6 +2301,7 @@ var Creature = {
     _cr.sonarT = 0; _cr.whiteHot = 0;
     _cr.snapT = 0; _cr.twitchT = 6 + Math.random() * 8; _cr.twitch = null;
     _cr.walkPhase = 0; _cr.stepT = 0.5; _cr.stepSide = false;
+    _cr.listenT = 3 + Math.random() * 3; _cr.listening = 0; _cr.headLag = 0;
     _cr.dustT = 0; _cr.lastTileX = -1; _cr.lastTileY = -1;
     _cr.afterT = 0;
     _cr.taken = false; _cr.takenT = 0; _cr.takenBeats = 0; _cr.lungeT = -1;
@@ -2044,10 +2321,11 @@ function _cr_resetMesh() {
   g.scale.set(1, 1, 1);
   _rig.rig.position.set(0, 0, 0);
   _rig.rig.scale.set(1, 1, 1);
-  _rig.torsoG.rotation.set(0.22, 0, 0);
-  _rig.neckG.rotation.set(0, 0, 0.19);
-  _rig.shoulderL.rotation.set(0, 0, 0.06);
-  _rig.shoulderR.rotation.set(0, 0, -0.06);
+  // v4 base pose: 25° hunch, head thrust forward + 6° left tilt.
+  _rig.torsoG.rotation.set(0.42, 0, 0);
+  _rig.neckG.rotation.set(-0.15, 0, 0.10);
+  _rig.shoulderL.rotation.set(0, 0, 0.08);
+  _rig.shoulderR.rotation.set(0, 0, -0.08);
   _rig.elbowL.rotation.set(0, 0, 0);
   _rig.elbowR.rotation.set(0, 0, 0);
   _rig.hipL.rotation.set(0, 0, 0);
@@ -2056,6 +2334,7 @@ function _cr_resetMesh() {
   _rig.kneeR.rotation.set(0, 0, 0);
   // Rung 0: absence — nothing visible, light off.
   for (var i = 0; i < _rig.flesh.length; i++) _rig.flesh[i].visible = false;
+  for (var bi = 0; bi < _rig.bones.length; bi++) _rig.bones[bi].visible = false;
   _rig.rim.visible = false;
   _rig.eyeL.visible = false; _rig.eyeR.visible = false;
   _rig.eyeLight.visible = false;
@@ -2129,11 +2408,20 @@ function _takenVeil(mode) {
   }
 }
 
-/* Build the creature mesh: ~13 primitives, pure black unlit silhouette.
- * Named pivots: neckG, shoulderL/R, elbowL/R, hipL/R, kneeL/R.
- * Hierarchy: group -> rig (weave/lunge offsets) -> pelvis/torsoG/hips,
- * torsoG -> torso, rim shell, shoulderL/R -> elbowL/R, neckG -> neck, head,
- * eyes, eye light, halo. Legs: hipL/R -> kneeL/R (digitigrade).
+/* Build the creature mesh: v4 redesign — "the starved alien".
+ * ~2.0 m procedurally built humanoid per the redesign brief: deep 25° hunch,
+ * overlong thin arms (forearm > upper arm, SCP-096 ratio), exposed ribcage
+ * (7 bone arcs, left ribs 7-8 broken), proud spine ridge (8 bone spheres),
+ * elongated smooth cranium (no nose/mouth/sockets), 4 tapered fingers per
+ * hand (right hand: 3 + broken stub), digitigrade legs, deliberate asymmetry
+ * (left forearm 8% longer, right shoulder higher, head tilted 6° left).
+ * Body is pure unlit black silhouette (MeshBasicMaterial 0x000000); bones
+ * are flat bone #CFC7B4 (they glint in the sonar pulse). Amber eyes
+ * (#FF7A1A) are the only face — left eye 10% larger, set lower, narrow gap.
+ * Named pivots: neckG, shoulderL/R, elbowL/R, handL/R, hipL/R, kneeL/R.
+ * Hierarchy: group -> rig -> pelvis/torsoG/hips; torsoG -> torso, ribs,
+ * spine, shoulderL/R -> elbowL/R -> handL/R -> fingers; neckG -> neck, head,
+ * eyes, eye light, halo. Legs: hipL/R -> kneeL/R (digitigrade) -> toes.
  */
 function buildCreatureMesh() {
   if (W3.creatureGroup) {
@@ -2158,74 +2446,132 @@ function buildCreatureMesh() {
   g.add(rig);
 
   var flesh = new THREE.MeshBasicMaterial({ color: 0x000000 });
+  var boneMat = new THREE.MeshBasicMaterial({ color: 0xCFC7B4 }); // exposed bone
   var rimMat = new THREE.MeshBasicMaterial({ color: 0x140303, side: THREE.BackSide });
-  var fleshMeshes = [];
+  var fleshMeshes = [], boneMeshes = [];
 
-  function part(geo, mat, x, y, z) {
-    var m = new THREE.Mesh(geo, mat || flesh);
+  function part(geo, m2, x, y, z, bones) {
+    var m = new THREE.Mesh(geo, m2 || flesh);
     m.position.set(x, y, z);
-    if (!mat || mat === flesh) fleshMeshes.push(m);
+    (bones ? boneMeshes : fleshMeshes).push(m);
     return m;
   }
 
-  // Pelvis block.
-  rig.add(part(new THREE.BoxGeometry(0.30, 0.22, 0.20), null, 0, 1.02, 0));
+  // Pelvis block (narrow — starved).
+  rig.add(part(new THREE.BoxGeometry(0.26, 0.20, 0.18), null, 0, 0.98, 0));
 
-  // Torso group (pivot at hips, y=1.05): pitch = hunch + idle sway.
+  // Torso group (pivot at hips, y=1.02): pitch = 25° hunch + idle sway.
   var torsoG = new THREE.Group();
-  torsoG.position.set(0, 1.05, 0);
+  torsoG.position.set(0, 1.02, 0);
   rig.add(torsoG);
-  var torso = part(new THREE.CylinderGeometry(0.17, 0.12, 0.72, 8), null, 0, 0.36, 0.02);
+  // Starved torso: narrow cylinder, waist pinched.
+  var torso = part(new THREE.CylinderGeometry(0.14, 0.10, 0.62, 8), null, 0, 0.31, 0.02);
   torsoG.add(torso);
   // Faint dark-red rim: slightly larger back-side shell of the torso.
-  var rim = new THREE.Mesh(new THREE.CylinderGeometry(0.185, 0.132, 0.74, 8), rimMat);
+  var rim = new THREE.Mesh(new THREE.CylinderGeometry(0.155, 0.112, 0.64, 8), rimMat);
   rim.position.copy(torso.position);
   torsoG.add(rim);
+  // Exposed ribcage: 7 bone arcs wrapping the torso. Left ribs 6-7 are
+  // BROKEN (asymmetry — "what escaped, and what didn't").
+  var ribs = [];
+  for (var ri = 0; ri < 7; ri++) {
+    var rr = 0.148 - ri * 0.005;
+    var broken = (ri >= 5);
+    var ribGeo = broken
+      ? new THREE.TorusGeometry(rr, 0.015, 6, 10, 3.4)
+      : new THREE.TorusGeometry(rr, 0.016, 6, 14);
+    var rib = part(ribGeo, boneMat, 0, 0.10 + ri * 0.062, 0.02, true);
+    rib.rotation.x = Math.PI / 2;
+    if (broken) {
+      rib.rotation.z = 2.2; // gap on the left side
+      rib.position.x = -0.02; rib.position.y -= 0.015;
+      rib.rotation.x += 0.18; // one fragment angled downward
+    }
+    torsoG.add(rib);
+    ribs.push(rib);
+  }
+  // Proud spine ridge: 8 bone spheres along the hunch, slightly proud of
+  // the skin — the hump is bone, not muscle.
+  var spine = [];
+  for (var si = 0; si < 8; si++) {
+    var sv = part(new THREE.SphereGeometry(0.032, 8, 6), boneMat,
+      (si % 2 ? 0.008 : -0.008), 0.04 + si * 0.068, -0.125 - si * 0.004, true);
+    torsoG.add(sv);
+    spine.push(sv);
+  }
   // Shoulder bar (gaunt clavicle ridge).
-  torsoG.add(part(new THREE.BoxGeometry(0.56, 0.12, 0.16), null, 0, 0.66, 0.05));
+  torsoG.add(part(new THREE.BoxGeometry(0.52, 0.10, 0.14), null, 0, 0.60, 0.05));
 
-  // Arms: ~1.3x human length, thin; forearm slightly longer than upper arm.
-  // shoulderL hangs ~10% lower (asymmetry).
+  // Arms: overlong (SCP-096 ratio — arm ≈ 62% of body height), thin;
+  // forearm LONGER than upper arm. Left forearm 8% longer, right shoulder
+  // sits higher (asymmetry).
   function buildArm(side) { // side: -1 left, +1 right
     var sh = new THREE.Group();
-    var drop = (side < 0) ? 0.06 : 0; // left arm hangs lower
-    sh.position.set(0.30 * side, 0.64 - drop, 0.07);
-    var upper = part(new THREE.CylinderGeometry(0.038, 0.030, 0.62, 6), null, 0, -0.31, 0);
+    var drop = (side < 0) ? 0.05 : -0.03; // left hangs lower, right higher
+    sh.position.set(0.27 * side, 0.58 - drop, 0.06);
+    var upper = part(new THREE.CylinderGeometry(0.034, 0.028, 0.38, 6), null, 0, -0.19, 0);
     sh.add(upper);
     var el = new THREE.Group();
-    el.position.set(0, -0.62, 0);
-    var fore = part(new THREE.CylinderGeometry(0.030, 0.022, 0.72, 6), null, 0, -0.36, 0);
+    el.position.set(0, -0.38, 0);
+    var foreLen = (side < 0) ? 0.45 : 0.42; // left 8% longer
+    var fore = part(new THREE.CylinderGeometry(0.028, 0.020, foreLen, 6), null, 0, -foreLen / 2, 0);
     el.add(fore);
+    // Hand: long metacarpals + tapered fingers. Left: 4 fingers.
+    // Right: 3 + one broken stub (asymmetry).
+    var hand = new THREE.Group();
+    hand.position.set(0, -foreLen, 0);
+    hand.add(part(new THREE.BoxGeometry(0.07, 0.10, 0.05), null, 0, -0.05, 0));
+    var nF = (side < 0) ? 4 : 3;
+    var fLens = (side < 0) ? [0.18, 0.20, 0.19, 0.16] : [0.18, 0.20, 0.17];
+    for (var fi2 = 0; fi2 < nF; fi2++) {
+      var fx = (fi2 - (nF - 1) / 2) * 0.028;
+      var fg = part(new THREE.CylinderGeometry(0.011, 0.006, fLens[fi2], 5),
+        null, fx, -0.10 - fLens[fi2] / 2, 0.01);
+      fg.rotation.z = -fx * 2.2; // splay
+      fg.rotation.x = 0.12;
+      hand.add(fg);
+    }
+    if (side > 0) { // broken stub on the right hand
+      var stub = part(new THREE.CylinderGeometry(0.011, 0.008, 0.06, 5),
+        null, 0.042, -0.12, 0.01);
+      stub.rotation.z = -0.09;
+      hand.add(stub);
+    }
+    el.add(hand);
     sh.add(el);
     torsoG.add(sh);
-    return { sh: sh, el: el };
+    return { sh: sh, el: el, hand: hand };
   }
   var armL = buildArm(-1), armR = buildArm(1);
 
-  // Neck group (pivot y=1.83 world): head yaw/pitch/tilt all live here.
+  // Neck group: thrust forward (predator scanning with its ears), tilted
+  // 6° left at rest (asymmetry).
   var neckG = new THREE.Group();
-  neckG.position.set(0, 0.78, 0.14); // forward of shoulders (deep hunch)
+  neckG.position.set(0, 0.72, 0.16);
   torsoG.add(neckG);
-  neckG.add(part(new THREE.CylinderGeometry(0.07, 0.09, 0.22, 6), null, 0, 0.08, 0.01));
+  neckG.add(part(new THREE.CylinderGeometry(0.06, 0.08, 0.18, 6), null, 0, 0.06, 0.01));
 
-  // Head: smooth featureless ovoid — no mouth, no nose. Only the eyes exist.
-  var head = part(new THREE.SphereGeometry(0.20, 14, 12), null, 0, 0.30, 0.05);
-  head.scale.set(0.85, 1.15, 0.95);
+  // Head: elongated smooth cranium — NO nose, NO mouth, NO eye sockets.
+  // A smooth shell; the back extends past where a jaw would be.
+  var head = part(new THREE.SphereGeometry(0.15, 14, 12), null, 0, 0.26, 0.03);
+  head.scale.set(0.67, 1.0, 1.0);
   neckG.add(head);
 
-  // Eyes: two amber spheres r=0.035 on the head front. The only face it has.
-  var eyeGeo = new THREE.SphereGeometry(0.035, 10, 8);
+  // Eyes: two amber spheres on the smooth shell. The ONLY face it has.
+  // Left 10% larger and set lower; gap slightly too narrow (subliminal).
+  var eyeGeoL = new THREE.SphereGeometry(0.030, 10, 8);
+  var eyeGeoR = new THREE.SphereGeometry(0.027, 10, 8);
   var eyeMatL = new THREE.MeshBasicMaterial({ color: CR_AMBER });
   var eyeMatR = new THREE.MeshBasicMaterial({ color: CR_AMBER });
-  var eyeL = new THREE.Mesh(eyeGeo, eyeMatL);
-  eyeL.position.set(-0.075, 0.32, 0.225);
-  var eyeR = new THREE.Mesh(eyeGeo, eyeMatR);
-  eyeR.position.set(0.075, 0.32, 0.225);
+  var eyeL = new THREE.Mesh(eyeGeoL, eyeMatL);
+  eyeL.position.set(-0.028, 0.276, 0.155);
+  var eyeR = new THREE.Mesh(eyeGeoR, eyeMatR);
+  eyeR.position.set(0.028, 0.280, 0.155);
   neckG.add(eyeL); neckG.add(eyeR);
 
   // ONE amber point light (the entire creature light budget), distance ~6.
   var eyeLight = new THREE.PointLight(CR_AMBER, 1.0, 6);
-  eyeLight.position.set(0, 0.32, 0.34);
+  eyeLight.position.set(0, 0.28, 0.24);
   neckG.add(eyeLight);
 
   // ONE additive halo sprite for the eye pair, scale pulsing 0.25–0.4.
@@ -2233,24 +2579,32 @@ function buildCreatureMesh() {
     map: _cr_haloTexture(), blending: THREE.AdditiveBlending,
     transparent: true, depthWrite: false, opacity: 0.6
   }));
-  halo.position.set(0, 0.32, 0.26);
-  halo.scale.set(0.3, 0.3, 1);
+  halo.position.set(0, 0.278, 0.19);
+  halo.scale.set(0.28, 0.28, 1);
   neckG.add(halo);
 
-  // Legs: reverse-jointed (digitigrade). Hip pivots at y=1.05.
+  // Legs: digitigrade (ankle high, foot extends forward), with toe spikes.
+  // Hip pivots at y=0.98.
   function buildLeg(side) {
     var hip = new THREE.Group();
-    hip.position.set(0.11 * side, 1.05, 0);
-    var thigh = part(new THREE.CylinderGeometry(0.055, 0.042, 0.55, 6), null, 0, -0.27, -0.02);
-    thigh.rotation.x = -0.12;
+    hip.position.set(0.10 * side, 0.98, 0);
+    var thigh = part(new THREE.CylinderGeometry(0.050, 0.038, 0.48, 6), null, 0, -0.24, -0.01);
+    thigh.rotation.x = -0.10;
     hip.add(thigh);
     var knee = new THREE.Group();
-    knee.position.set(0, -0.55, -0.06);
-    var shin = part(new THREE.CylinderGeometry(0.040, 0.028, 0.52, 6), null, 0, -0.24, 0.10);
-    shin.rotation.x = 0.42; // reverse joint: shin angles forward-down
+    knee.position.set(0, -0.48, -0.03);
+    var shin = part(new THREE.CylinderGeometry(0.036, 0.026, 0.42, 6), null, 0, -0.20, 0.06);
+    shin.rotation.x = 0.38; // digitigrade: shin angles forward-down
     knee.add(shin);
-    var foot = part(new THREE.BoxGeometry(0.09, 0.06, 0.22), null, 0, -0.47, 0.20);
+    var foot = part(new THREE.BoxGeometry(0.08, 0.05, 0.20), null, 0, -0.40, 0.12);
     knee.add(foot);
+    // 3 toe spikes forward.
+    for (var ti = 0; ti < 3; ti++) {
+      var toe = part(new THREE.ConeGeometry(0.014, 0.10, 5), null,
+        (ti - 1) * 0.030, -0.41, 0.25);
+      toe.rotation.x = Math.PI / 2 + 0.25;
+      knee.add(toe);
+    }
     hip.add(knee);
     rig.add(hip);
     return { hip: hip, knee: knee };
@@ -2276,10 +2630,13 @@ function buildCreatureMesh() {
 
   _rig = {
     group: g, rig: rig, torsoG: torsoG, neckG: neckG, head: head,
-    shoulderL: armL.sh, elbowL: armL.el, shoulderR: armR.sh, elbowR: armR.el,
+    shoulderL: armL.sh, elbowL: armL.el, handL: armL.hand,
+    shoulderR: armR.sh, elbowR: armR.el, handR: armR.hand,
     hipL: legL.hip, kneeL: legL.knee, hipR: legR.hip, kneeR: legR.knee,
+    ribs: ribs, spine: spine,
     eyeMatL: eyeMatL, eyeMatR: eyeMatR, eyeL: eyeL, eyeR: eyeR,
-    eyeLight: eyeLight, halo: halo, flesh: fleshMeshes, rim: rim, afters: afters,
+    eyeLight: eyeLight, halo: halo, flesh: fleshMeshes, rim: rim,
+    bones: boneMeshes, afters: afters,
     yaw: 0, lastWX: w0.x, lastWZ: w0.z
   };
   _cr.lastWX = w0.x; _cr.lastWZ = w0.z;
@@ -2380,6 +2737,8 @@ function syncCreatureMesh(dt) {
   var rung = _cr.effRung;
   var bodyVis = rung >= 3, eyeVis = rung >= 2;
   for (var fi = 0; fi < _rig.flesh.length; fi++) _rig.flesh[fi].visible = bodyVis;
+  // v4: exposed bones read only with the body (rung 3+) — they glint in sonar.
+  for (var bi2 = 0; bi2 < _rig.bones.length; bi2++) _rig.bones[bi2].visible = bodyVis;
   _rig.rim.visible = bodyVis;
   _rig.eyeL.visible = eyeVis; _rig.eyeR.visible = eyeVis;
   _rig.eyeLight.visible = eyeVis;
@@ -2412,6 +2771,7 @@ function syncCreatureMesh(dt) {
   var bright = 0.22 + 0.78 * s01;
   if (s01 < 0.4) bright *= 0.72 + 0.28 * Math.sin(t * 13.0) * Math.sin(t * 7.3);
   if (blinking) bright = 0;          // extinguish
+  if (_cr.listening > 0) bright *= 0.2; // v4: eyes dim to 20% while listening
   if (_cr.sonarT > 0) bright = 1.15; // sonarFlash: full amber
   if (bright > 1.15) bright = 1.15;
   var bc = Math.max(0, Math.min(1, bright));
@@ -2426,45 +2786,71 @@ function syncCreatureMesh(dt) {
     Math.min(1, 0.30 + 0.55 * s01 + (_cr.sonarT > 0 ? 0.25 : 0)) : 0;
 
   // 6. Animations on the named pivots.
-  var swayAmt = hunt ? 0 : 1; // HUNT: all noise removed
-  var stepDur = hunt ? 0.32 : (st === 'INVESTIGATE' ? 0.45 : 0.62);
-  if (moving) _cr.walkPhase += dt * 2 * Math.PI / stepDur;
-  var ph = _cr.walkPhase;
-  var swing = moving ? 1 : 0;
+  // v4: listening freeze — every 4-7 s in ROAM/SEARCH, the creature STOPS
+  // for 0.6-1.0 s, cocks its head 25° (listening), eyes dim to 20%.
+  // Stillness that never reads as safe.
+  _cr.listenT -= dt;
+  if (_cr.listenT <= 0 && !hunt && (st === 'ROAM' || st === 'SEARCH')) {
+    _cr.listening = 0.6 + Math.random() * 0.4;
+    _cr.listenT = 4 + Math.random() * 3;
+  }
+  var listening = _cr.listening > 0;
+  if (listening) _cr.listening -= dt;
 
-  // (1) idle sway: torso pitch ±3° @0.5 Hz; head tilt 8°→14° @0.23 Hz with a
-  // detuned second sine so it never loops cleanly; arms counter-phase ±4°.
-  _rig.torsoG.rotation.x = (hunt ? 0.34 : 0.22) + swayAmt * Math.sin(t * Math.PI) * 0.052;
+  var swayAmt = (hunt || listening) ? 0 : 1; // HUNT/listen: all noise removed
+  var stepDur = hunt ? 0.32 : (st === 'INVESTIGATE' ? 0.45 : 0.62);
+  if (moving && !listening) _cr.walkPhase += dt * 2 * Math.PI / stepDur;
+  var ph = _cr.walkPhase;
+  // v4: quantized walk — joints snap in discrete steps (6 per cycle),
+  // not smooth sines. The walk never looks human.
+  var phQ = Math.floor(ph / (Math.PI / 3)) * (Math.PI / 3) + (Math.PI / 6);
+  var swing = (moving && !listening) ? 1 : 0;
+
+  // (1) idle sway: torso pitch ±3° @0.5 Hz around the 25° hunch; head tilt
+  // with a detuned second sine so it never loops cleanly; arms counter-phase.
+  // During the listening freeze the head cocks 25° sideways instead.
+  _rig.torsoG.rotation.x = (hunt ? 0.52 : 0.42) + swayAmt * Math.sin(t * Math.PI) * 0.052;
   if (!frozen) {
-    _rig.neckG.rotation.z = (hunt ? 0.07 : 0.19) + swayAmt *
+    var tiltBase = listening ? 0.44 : (hunt ? 0.07 : 0.10);
+    _rig.neckG.rotation.z = tiltBase + swayAmt *
       (Math.sin(t * 2 * Math.PI * 0.23 + 1.7) * 0.052 + Math.sin(t * 0.61) * 0.012);
     if (hunt) _rig.neckG.rotation.y += (0 - _rig.neckG.rotation.y) * Math.min(1, dt * 6);
     else if (st === 'INVESTIGATE') _rig.neckG.rotation.y += (0 - _rig.neckG.rotation.y) * Math.min(1, dt * 1.5);
   }
+  // v4: head lag — the head counter-rotates against body turns, correcting
+  // ~200 ms late (bird-like, wrong-speed).
+  _cr.headLag = (_cr.headLag || 0) + ((listening ? 0 : -d * 0.25) - (_cr.headLag || 0)) * Math.min(1, dt * 5);
+  if (!frozen && !hunt) _rig.neckG.rotation.y += _cr.headLag * 0.5;
 
   if (hunt) {
-    // (5) hunt run: torso drops (above), arms pump, head locked forward.
+    // (5) hunt run: torso drops deeper, arms pump, head locked forward.
     _rig.shoulderL.rotation.x = Math.sin(ph) * 0.7;
     _rig.shoulderR.rotation.x = Math.sin(ph + Math.PI) * 0.7;
     _rig.elbowL.rotation.x = -0.9; _rig.elbowR.rotation.x = -0.9;
     _rig.shoulderL.rotation.z = 0.15; _rig.shoulderR.rotation.z = -0.15;
     _rig.rig.position.x = 0;
   } else {
-    // (4) knuckle-drag walk: long arm swing, torso bob 0.06 m at step
-    // frequency, ±0.15 m lateral weave, feet skim (no IK grounding).
-    _rig.shoulderL.rotation.x = swing * Math.sin(ph) * 0.55;
-    _rig.shoulderR.rotation.x = swing * Math.sin(ph + Math.PI) * 0.55;
-    _rig.elbowL.rotation.x = -0.22 - swing * Math.max(0, Math.sin(ph)) * 0.25;
-    _rig.elbowR.rotation.x = -0.22 - swing * Math.max(0, Math.sin(ph + Math.PI)) * 0.25;
-    _rig.shoulderL.rotation.z = 0.06 + swayAmt * Math.sin(t * Math.PI + Math.PI) * 0.07;
-    _rig.shoulderR.rotation.z = -0.06 + swayAmt * Math.sin(t * Math.PI) * 0.07;
-    _rig.rig.position.x = swing * Math.sin(ph * 0.5) * 0.15;
+    // (4) knuckle-drag walk: long arm swing, torso bob at step frequency,
+    // lateral weave. Quantized phase => jerky, not smooth.
+    _rig.shoulderL.rotation.x = swing * Math.sin(phQ) * 0.55;
+    _rig.shoulderR.rotation.x = swing * Math.sin(phQ + Math.PI) * 0.55;
+    _rig.elbowL.rotation.x = -0.22 - swing * Math.max(0, Math.sin(phQ)) * 0.25;
+    _rig.elbowR.rotation.x = -0.22 - swing * Math.max(0, Math.sin(phQ + Math.PI)) * 0.25;
+    _rig.shoulderL.rotation.z = 0.08 + swayAmt * Math.sin(t * Math.PI + Math.PI) * 0.07;
+    _rig.shoulderR.rotation.z = -0.08 + swayAmt * Math.sin(t * Math.PI) * 0.07;
+    _rig.rig.position.x = swing * Math.sin(phQ * 0.5) * 0.15;
   }
-  _rig.rig.position.y = swing * Math.abs(Math.sin(ph)) * 0.06;
-  _rig.hipL.rotation.x = swing * Math.sin(ph) * 0.45;
-  _rig.hipR.rotation.x = swing * Math.sin(ph + Math.PI) * 0.45;
-  _rig.kneeL.rotation.x = swing * Math.max(0, -Math.sin(ph)) * 0.55;
-  _rig.kneeR.rotation.x = swing * Math.max(0, -Math.sin(ph + Math.PI)) * 0.55;
+  _rig.rig.position.y = swing * Math.abs(Math.sin(phQ)) * 0.06;
+  _rig.hipL.rotation.x = swing * Math.sin(phQ) * 0.45;
+  _rig.hipR.rotation.x = swing * Math.sin(phQ + Math.PI) * 0.45;
+  _rig.kneeL.rotation.x = swing * Math.max(0, -Math.sin(phQ)) * 0.55;
+  _rig.kneeR.rotation.x = swing * Math.max(0, -Math.sin(phQ + Math.PI)) * 0.55;
+  // v4: spine ripple — a peristaltic wave down the exposed vertebrae,
+  // suggesting something under the skin.
+  for (var spi = 0; spi < _rig.spine.length; spi++) {
+    _rig.spine[spi].position.z = -0.125 - spi * 0.004 +
+      0.008 * Math.sin(t * 3.1 - spi * 0.9) * (moving ? 1 : 0.4);
+  }
 
   // (3) twitch: every 6–14 s one random limb does a 90 ms double-jerk ±15°.
   // Never during HUNT (hunt reads as purposeful).
@@ -2656,14 +3042,14 @@ function _updateTaken(dt) {
     g.position.x = _cr.lungeFromX + (_cr.lungeToX - _cr.lungeFromX) * e;
     g.position.z = _cr.lungeFromZ + (_cr.lungeToZ - _cr.lungeFromZ) * e;
     var lead = _cr.lungeArm; // which arm leads this capture
-    _rig.shoulderL.rotation.z = 0.06 + e * 1.25 * (lead < 0 ? 1.15 : 1.0);
-    _rig.shoulderR.rotation.z = -0.06 - e * 1.25 * (lead > 0 ? 1.15 : 1.0);
+    _rig.shoulderL.rotation.z = 0.08 + e * 1.25 * (lead < 0 ? 1.15 : 1.0);
+    _rig.shoulderR.rotation.z = -0.08 - e * 1.25 * (lead > 0 ? 1.15 : 1.0);
     _rig.shoulderL.rotation.x = e * 0.4;
     _rig.shoulderR.rotation.x = e * 0.4;
     _rig.elbowL.rotation.x = -e * 0.3;
     _rig.elbowR.rotation.x = -e * 0.3;
     _rig.neckG.rotation.x = -0.55 * e; // head tilts back
-    _rig.torsoG.rotation.x = 0.34 - 0.15 * e;
+    _rig.torsoG.rotation.x = 0.52 - 0.15 * e;
     // v3: FOV PUNCH + violent screen shake. FOV kicks 70 -> 94 at peak
     // violence and snaps back as the hard cut lands; the camera shakes
     // hardest at lunge start and settles into the black.
@@ -2814,9 +3200,38 @@ function doSonar3D() {
   _s_spawnSonarPulse(pt.x, pt.y);
   emitNoise(pt.x, pt.y, C.SONAR_NOISE_R, C.PULSE_SUSP);
   G.pulsesUsed++;
+  // v4: tactical map intel — a ping marks the creature's last-known tile,
+  // but ONLY if it was inside the sonar radius. The map never tracks live.
+  var cc = G.creature;
+  var cd = Math.hypot(pt.x - cc.x, pt.y - cc.y);
+  if (cd <= R) {
+    G.pingMark = {
+      x: Math.floor(cc.x), y: Math.floor(cc.y),
+      rt: (typeof performance !== 'undefined' ? performance.now() / 1000 : 0)
+    };
+  }
   if (typeof Creature !== 'undefined' && Creature.sonarFlash) Creature.sonarFlash();
   if (typeof Sfx !== 'undefined') {
     if (Sfx.sonarPing3D) Sfx.sonarPing3D(); else Sfx.ping();
+  }
+}
+
+// v4: tactical map intel — keycards/exit the player has SEEN (close
+// proximity or a fresh sonar reveal on their tile). Unseen = not drawn.
+function updateMapIntel() {
+  var p = G.player, i, d, fresh;
+  for (i = 0; i < G.keycards.length; i++) {
+    if (G.seenKC[i]) continue;
+    var kc = G.keycards[i];
+    d = Math.hypot(p.x - (kc.x + 0.5), p.y - (kc.y + 0.5));
+    fresh = (G.time - G.reveal[kc.y * C.W + kc.x]) < C.SONAR_REVEAL_T;
+    if (d < 3.5 || (fresh && d <= C.SONAR_REVEAL_R)) G.seenKC[i] = true;
+  }
+  if (!G.seenExit) {
+    var e = G.exit;
+    d = Math.hypot(p.x - (e.x + 0.5), p.y - (e.y + 0.5));
+    fresh = (G.time - G.reveal[e.y * C.W + e.x]) < C.SONAR_REVEAL_T;
+    if (d < 3.5 || (fresh && d <= C.SONAR_REVEAL_R)) G.seenExit = true;
   }
 }
 
@@ -4720,6 +5135,17 @@ function buildHUD() {
     '.ec3-notebody { font-size: 15px; line-height: 1.9; color: #E8E4D8; }',
     '.ec3-notehint { margin-top: 20px; font-size: 11px; letter-spacing: 3px;',
     '  color: #8A939B; }',
+    // v4: tactical map overlay (phosphor-terminal blueprint)
+    '.ec3-mapov { position: fixed; inset: 0; z-index: 60; display: none;',
+    '  align-items: center; justify-content: center; flex-direction: column;',
+    '  background: rgba(5,7,10,0.90); }',
+    '.ec3-mapov.on { display: flex; }',
+    '.ec3-maptitle { font-size: 15px; letter-spacing: 6px; color: #7FD4E8;',
+    '  margin-bottom: 14px; font-family: "Courier New", Courier, monospace; }',
+    '.ec3-mapcard { border: 1px solid rgba(127,212,232,0.4);',
+    '  background: rgba(11,18,32,0.96); padding: 18px; }',
+    '.ec3-maphint { margin-top: 14px; font-size: 11px; letter-spacing: 3px;',
+    '  color: #8A939B; font-family: "Courier New", Courier, monospace; }',
     // v3: intro fade + PA subtitle
     '.ec3-introfade { position: fixed; inset: 0; z-index: 70; pointer-events: none;',
     '  background: #000; opacity: 0; transition: opacity 0.8s linear; }',
@@ -4808,7 +5234,7 @@ function buildHUD() {
 
   // --- mute indicator -----------------------------------------------------------
   const mute = _el('div', 'ec3-hud ec3-mute', document.body);
-  mute.textContent = '[M] MUTED';
+  mute.textContent = '[N] MUTED';
 
   // --- v3: stamina bar (bottom-left, under the access badges) ------------------
   const stamLabel = _el('div', 'ec3-hud', document.body);
@@ -4837,6 +5263,18 @@ function buildHUD() {
   const introFade = _el('div', 'ec3-introfade', document.body);
   const paSub = _el('div', 'ec3-hud ec3-pasub', document.body);
 
+  // --- v4: tactical map overlay -------------------------------------------------
+  const mapOv = _el('div', 'ec3-mapov', document.body);
+  const mapTitle = _el('div', 'ec3-maptitle', mapOv);
+  mapTitle.textContent = 'LAB 7 — TACTICAL MAP';
+  const mapCard = _el('div', 'ec3-mapcard', mapOv);
+  const mapCanvas = document.createElement('canvas');
+  mapCanvas.width = 640; mapCanvas.height = 500;
+  mapCanvas.style.display = 'block';
+  mapCard.appendChild(mapCanvas);
+  const mapHint = _el('div', 'ec3-maphint', mapOv);
+  mapHint.textContent = 'M / ESC — CLOSE · N — MUTE';
+
   // --- screens ------------------------------------------------------------------
   const screens = {};
   const names = ['TITLE', 'HOWTO', 'PAUSE', 'WIN', 'LOSE'];
@@ -4857,7 +5295,7 @@ function buildHUD() {
   const tc2 = _el('div', 'ec3-ctrl', d);
   tc2.innerHTML = 'WASD — move · SHIFT — move quietly · C — crouch<br>' +
     'SPACE — sonar pulse (it reveals… but it hears)<br>' +
-    'Q — throw lure · E — drop radio · M — mute';
+    'Q — throw lure · E — drop radio · M — map · N — mute';
   _el('div', 'ec3-note', d).textContent = 'Headphones recommended.';
 
   // HOWTO: field protocol.
@@ -4879,7 +5317,7 @@ function buildHUD() {
   _el('div', 'ec3-head', d).textContent = 'PAUSED';
   _el('div', 'ec3-tag', d).textContent = 'SENSORS HELD';
   const pc = _el('div', 'ec3-ctrl', d);
-  pc.textContent = 'ENTER / ESC — resume · R — restart · M — mute';
+  pc.textContent = 'ENTER / ESC — resume · R — restart · M — map · N — mute';
 
   // WIN: ESCAPED + stats (filled in updateScreens).
   d = screens.WIN;
@@ -4909,6 +5347,7 @@ function buildHUD() {
     stamFill: stamFill, anger: anger, notePrompt: notePrompt,
     noteOv: noteOv, noteTitle: noteTitle, noteBody: noteBody,
     introFade: introFade, paSub: paSub,
+    mapOv: mapOv, mapCanvas: mapCanvas,
     _last: { keys: -1, obj: '', cd: -1, th: -1, ra: -1, tut: '\u0000', bands: -1, heard: null, mute: null, vig: -1,
              stam: -1, anger: null, notep: null }
   };
@@ -4920,6 +5359,9 @@ function updateHUD() {
   if (!_hud) return;
   const L = _hud._last;
   const inPlay = G.state === 'PLAY';
+
+  // v4: tactical map stays live while open (fading "?" ping marker).
+  if (G.mapOpen && typeof _drawMap === 'function') _drawMap();
 
   // Keycard access badges: fill amber as collected.
   if (G.keys !== L.keys) {
@@ -5053,6 +5495,133 @@ function hideNote() {
   _hud.noteOv.classList.remove('on');
 }
 
+// v4: tactical map overlay (phosphor-terminal blueprint). Fog of war:
+// only visited tiles + walls adjacent to them are drawn. Intel (keycards,
+// exit) only if seen. The creature is NEVER tracked live — only the fading
+// "?" ping mark from the last sonar pulse.
+function showMap() {
+  if (!_hud) return;
+  _drawMap();
+  _hud.mapOv.classList.add('on');
+}
+function hideMap() {
+  if (!_hud) return;
+  _hud.mapOv.classList.remove('on');
+}
+function _drawMap() {
+  if (!_hud || !G.visited) return;
+  var cv = _hud.mapCanvas, g = cv.getContext('2d');
+  var W = C.W, H = C.H, TS = 34;
+  var ox = Math.floor((cv.width - W * TS) / 2);
+  var oy = Math.floor((cv.height - H * TS) / 2) + 8;
+  // backdrop
+  g.fillStyle = '#0B1220';
+  g.fillRect(0, 0, cv.width, cv.height);
+  var x, y, idx;
+  // pass 1: visited floors
+  for (y = 0; y < H; y++) {
+    for (x = 0; x < W; x++) {
+      idx = y * W + x;
+      if (G.grid[y][x] === 0 && G.visited[idx]) {
+        g.fillStyle = '#16202f';
+        g.fillRect(ox + x * TS + 1, oy + y * TS + 1, TS - 2, TS - 2);
+      }
+    }
+  }
+  // pass 2: walls adjacent to visited floor (the floor plan reads)
+  function vis(x2, y2) {
+    return x2 >= 0 && y2 >= 0 && x2 < W && y2 < H && G.visited[y2 * W + x2];
+  }
+  for (y = 0; y < H; y++) {
+    for (x = 0; x < W; x++) {
+      if (G.grid[y][x] !== 1) continue;
+      if (!(vis(x+1,y) || vis(x-1,y) || vis(x,y+1) || vis(x,y-1))) continue;
+      g.fillStyle = '#2c3a52';
+      g.fillRect(ox + x * TS, oy + y * TS, TS, TS);
+      g.strokeStyle = 'rgba(127,212,232,0.25)';
+      g.lineWidth = 1;
+      g.strokeRect(ox + x * TS + 0.5, oy + y * TS + 0.5, TS - 1, TS - 1);
+    }
+  }
+  // pass 3: grid ticks on visited area
+  g.strokeStyle = 'rgba(127,212,232,0.08)';
+  g.lineWidth = 1;
+  // room labels (only where the player has been)
+  var labels = [
+    { t: 'LAB 7', x: 2, y: 1 }, { t: 'CONTAINMENT', x: 9, y: 3 },
+    { t: 'STORAGE', x: 3, y: 8 }, { t: 'AIRLOCK', x: 12, y: 6 }
+  ];
+  g.font = '10px "Courier New", monospace';
+  g.textAlign = 'center';
+  for (var li = 0; li < labels.length; li++) {
+    var lb = labels[li];
+    if (!vis(lb.x, lb.y)) continue;
+    g.fillStyle = 'rgba(138,147,155,0.55)';
+    g.fillText(lb.t, ox + lb.x * TS + TS / 2, oy + lb.y * TS + TS / 2 + 3);
+  }
+  // keycards: amber diamonds (seen only; taken = dim tick)
+  for (var ki = 0; ki < G.keycards.length; ki++) {
+    var kc = G.keycards[ki];
+    var kx = ox + kc.x * TS + TS / 2, ky = oy + kc.y * TS + TS / 2;
+    if (kc.taken) {
+      g.fillStyle = 'rgba(245,165,36,0.25)';
+      g.font = 'bold 13px "Courier New", monospace';
+      g.fillText('✓', kx, ky + 4);
+    } else if (G.seenKC[ki]) {
+      g.fillStyle = '#F5A524';
+      g.beginPath();
+      g.moveTo(kx, ky - 9); g.lineTo(kx + 9, ky);
+      g.lineTo(kx, ky + 9); g.lineTo(kx - 9, ky);
+      g.closePath(); g.fill();
+      g.fillStyle = '#05070A';
+      g.font = 'bold 11px "Courier New", monospace';
+      g.fillText(String(ki + 1), kx, ky + 4);
+    }
+  }
+  // exit: green door (seen only)
+  if (G.seenExit) {
+    var ex = ox + G.exit.x * TS + TS / 2, ey = oy + G.exit.y * TS + TS / 2;
+    g.strokeStyle = G.exit.open ? '#7dff9a' : '#3ddc68';
+    g.lineWidth = 2;
+    g.strokeRect(ex - 11, ey - 11, 22, 22);
+    g.fillStyle = G.exit.open ? '#7dff9a' : '#3ddc68';
+    g.font = '9px "Courier New", monospace';
+    g.fillText(G.exit.open ? 'OPEN' : 'EXIT', ex, ey + 24);
+  }
+  // last-known creature ping: fading red "?" (never live-tracked)
+  if (G.pingMark) {
+    var nowR = (typeof performance !== 'undefined' ? performance.now() / 1000 : 0);
+    var age = nowR - G.pingMark.rt;
+    var a = Math.max(0, 1 - age / 12);
+    if (a > 0) {
+      var px = ox + G.pingMark.x * TS + TS / 2, py = oy + G.pingMark.y * TS + TS / 2;
+      g.globalAlpha = a;
+      g.strokeStyle = '#C0392B';
+      g.lineWidth = 1.5;
+      g.beginPath(); g.arc(px, py, 12 + (1 - a) * 8, 0, 7); g.stroke();
+      g.fillStyle = '#C0392B';
+      g.font = 'bold 15px "Courier New", monospace';
+      g.fillText('?', px, py + 5);
+      g.globalAlpha = 1;
+    }
+  }
+  // player: ice triangle, rotated by yaw (yaw=0 faces north = map up)
+  var pwx = ox + G.player.x * TS, pwy = oy + G.player.y * TS;
+  g.save();
+  g.translate(pwx, pwy);
+  g.rotate(-G.player.yaw);
+  g.fillStyle = '#BFEFFF';
+  g.beginPath();
+  g.moveTo(0, -11); g.lineTo(8, 8); g.lineTo(-8, 8);
+  g.closePath(); g.fill();
+  g.restore();
+  // legend
+  g.fillStyle = 'rgba(232,228,216,0.6)';
+  g.font = '10px "Courier New", monospace';
+  g.textAlign = 'left';
+  g.fillText('◆ KEYCARD    ▭ EXIT    ? LAST PING    ▲ YOU', ox + 6, oy + H * TS + 22);
+}
+
 // v3: intro sequence HUD — fade from black, PA subtitle.
 function showIntroHUD() {
   if (!_hud) return;
@@ -5128,11 +5697,14 @@ function _playStep3D(dt) {
   if (G.heardFlash > 0) G.heardFlash = Math.max(0, G.heardFlash - dt);
   // v3: reading a note freezes the sim (the overlay has the player's eyes).
   if (G.noteOpen >= 0) return;
+  // v4: tactical map open freezes the sim too.
+  if (G.mapOpen) return;
   // Freeze player input during the TAKEN death cinematic (creature.js owns the
   // 1.2s timeline via Creature.beginTaken()); everything else keeps ticking.
   if (!(typeof Creature !== 'undefined' && Creature.takenActive && Creature.takenActive())) updatePlayer3D(dt);
   updateRadios(dt);
   updateCreature(dt);
+  if (typeof updateMapIntel === 'function') updateMapIntel();
   if (typeof syncCreatureMesh === 'function') syncCreatureMesh(dt);
   checkCapture3D();
   Tut.update(dt);
