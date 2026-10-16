@@ -3513,9 +3513,9 @@ function buildKeycards3D() {
     // Glow beam: additive amber pillar, floor to near-ceiling. depthWrite
     // off so it never occludes; it reads as a beacon in the dark.
     var beam = new THREE.Mesh(
-      new THREE.CylinderGeometry(0.16, 0.3, 2.9, 12, 1, true),
+      new THREE.CylinderGeometry(0.25, 0.45, 2.9, 12, 1, true),
       new THREE.MeshBasicMaterial({ color: _s_AMBER, transparent: true,
-        opacity: 0.16, blending: THREE.AdditiveBlending,
+        opacity: 0.4, blending: THREE.AdditiveBlending,
         side: THREE.DoubleSide, depthWrite: false })
     );
     beam.position.set(c.x, 1.55, c.z);
@@ -3524,7 +3524,7 @@ function buildKeycards3D() {
     W3.keyBeams.push(beam);
     // Pulsing point light: short range, low intensity — a local warm pool
     // around the card, not a scene light. (3 keycards = 3 small lights.)
-    var pl = new THREE.PointLight(_s_AMBER, 0.7, 6, 2);
+    var pl = new THREE.PointLight(_s_AMBER, 1.5, 8, 2);
     pl.position.set(c.x, 1.4, c.z);
     pl.userData.phase = k * 1.9;
     W3.scene.add(pl);
