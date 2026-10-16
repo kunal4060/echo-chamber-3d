@@ -18,8 +18,10 @@ SPACE ............ sonar pulse — reveals nearby walls/objects for 2.5s,
                    BUT the sound may attract the creature (4s cooldown)
 Q / F / click .... throw a distraction 4 tiles ahead (3 total)
 E ................ drop a radio lure (2 total, ticks for 12s)
+F (near note) .... read lab notes scattered in the lab
+M ................ tactical map (fog of war — only visited areas shown)
+N ................ mute
 R ................ restart (keycards are kept)
-M ................ mute
 ENTER ............ start / advance screens
 ESC .............. pause
 
