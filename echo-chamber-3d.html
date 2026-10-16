@@ -10,6 +10,7 @@
 <script src="three.min.js"></script>
 <script>
 
+/* ===== build3d/world.js ===== */
 // Echo Chamber 3D — world.js
 // WORLD worker: defines C, G, LEVEL, W3. Implements initThree, buildMaze3D,
 // initLevel3D, updatePlayer3D, tileFromWorld, worldFromTile, render3D, and the
@@ -32,18 +33,22 @@ const C = {
   SONAR_REVEAL_R: 6,                // tiles (Euclidean)
   SONAR_REVEAL_T: 2.5,              // seconds of visibility
   SONAR_CD: 4,                      // seconds cooldown
-  SONAR_NOISE_R: 8,                 // noise emitted — larger than reveal
+  SONAR_NOISE_R: 5,                 // noise emitted — v5: 8→5 (was map-wide)
   P_SPEED: 4.0,                     // tiles/sec normal
   Q_SPEED: 2.4,                     // tiles/sec quiet (Shift)
   P_NOISE_R: 3, Q_NOISE_R: 1,       // noise radius per tile entered
   P_SUSP: 12, Q_SUSP: 4,            // suspicion per step
-  C_ROAM_SPD: 1.8, C_INV_SPD: 3.0, C_HUNT_SPD: 3.03,   // tiles/sec (v4: HUNT -21% per playtest)
-  C_TICK_ROAM: 0.55, C_TICK_INV: 0.33, C_TICK_HUNT: 0.33, // seconds per creature step
+  C_ROAM_SPD: 1.8, C_INV_SPD: 3.0, C_HUNT_SPD: 2.6,   // tiles/sec (v5: HUNT 3.03→2.6)
+  C_TICK_ROAM: 0.55, C_TICK_INV: 0.33, C_TICK_HUNT: 0.385, // seconds per creature step (v5: 0.33→0.385)
   VISION_R: 2,                      // creature vision (Bresenham LOS)
   CAPTURE_D: 0.6,                   // tiles — capture distance
   SUSP_MAX: 100, SUSP_DECAY: 8, SUSP_DECAY_HIDDEN: 20, // per second
   SUSP_INVESTIGATE: 40, SUSP_HUNT: 100, SUSP_DROP: 35, // thresholds
-  PULSE_SUSP: 70, THROW_SUSP: 40, RADIO_SUSP: 25,
+  PULSE_SUSP: 55, THROW_SUSP: 60, RADIO_SUSP: 25, // v5: sonar 70→55 (fair tradeoff);
+                                                 // throw 40→60 so lures still trigger INVESTIGATE on EASY (60×0.7=42≥40)
+  // v5: sonar grace — after 10s of quiet, a sonar pings softly (reduced
+  // noise) so players can orient without instant punishment.
+  SONAR_GRACE_T: 10, SONAR_GRACE_R: 3, SONAR_GRACE_SUSP: 40,
   THROW_N: 3, THROW_RANGE: 5, THROW_NOISE_R: 5,  // Manhattan range, needs LOS
   RADIO_N: 2, RADIO_TICK_R: 4, RADIO_TICK_T: 2, RADIO_LIFE: 12, // seconds
   HIDE_T: 1.5,                      // still seconds -> hidden
@@ -92,6 +97,12 @@ const G = {
   muted: false,
   heardFlash: 0,             // HUD "HEARD" flicker timer
   mapRevealed: false,        // one-time start reveal done
+  // --- v5 playability state ---
+  lastNoiseT: -1e3,          // G.time of last emitted noise (sonar grace calc)
+  inputLockT: 0,             // action-key lock after PLAY transition (anti-misfire)
+  // --- v5 difficulty ---
+  difficulty: 'NORMAL',      // EASY | NORMAL | HARD (TITLE selector)
+  diffHuntTick: 1, diffNoiseR: 1, diffSusp: 1, diffCd: 1, diffGlow: 1, // resolved per run
   // --- v3 feature state ---
   stamina: 100,              // sprint stamina 0..100
   sprinting: false,          // double-tap-hold sprint active
@@ -124,6 +135,23 @@ const LEVEL = [
   "###############",
 ];
 
+// ------------------------------------------- v5: difficulty selector --
+// TITLE screen: LEFT/RIGHT arrows cycle, ENTER continues. Multipliers are
+// resolved into G.diff* fields by initLevel3D (per run, not per frame).
+const DIFFS = [
+  { id: 'EASY',   tag: 'GUIDED',
+    desc: 'Slower specimen · softer pings · brighter keycards. Explore the story.' },
+  { id: 'NORMAL', tag: 'STANDARD',
+    desc: 'The intended hunt. Fair — but it is listening.' },
+  { id: 'HARD',   tag: 'NIGHTMARE',
+    desc: 'Faster, sharper-eared specimen. For those who like dying.' },
+];
+const D_MULT = {
+  EASY:   { huntTick: 1.25,  noiseR: 0.8, susp: 0.7, cd: 0.75, glow: 1.6 },
+  NORMAL: { huntTick: 1,     noiseR: 1,   susp: 1,   cd: 1,    glow: 1   },
+  HARD:   { huntTick: 0.833, noiseR: 1.2, susp: 1.3, cd: 1.25, glow: 1   },
+};
+
 // --------------------------------------------------------------- W3 ----
 const W3 = {
   scene: null, camera: null, renderer: null,
@@ -131,6 +159,8 @@ const W3 = {
   floorMats: [],     // [y][x] floor material (individual per tile)
   creatureGroup: null,
   keyMeshes: [],
+  keyBeams: [],       // v5: additive glow pillars above keycards (visibility)
+  keyLights: [],      // v5: pulsing point lights at keycard spots
   exitMesh: null,
   radioMeshes: [],
   ringGroup: null,
@@ -1343,6 +1373,15 @@ function initLevel3D(keepKeys) {
   G.loseReason = '';
   G.heardFlash = 0;
   G.mapRevealed = false;
+  // v5: fresh run — no recent noise (sonar grace available), brief action
+  // lock so a double-tapped intro-skip key can't misfire sonar.
+  G.lastNoiseT = -1e3;
+  G.inputLockT = 0.4;
+  // v5: resolve difficulty multipliers for this run.
+  var _dm = (typeof D_MULT !== 'undefined' && D_MULT[G.difficulty]) || null;
+  if (!_dm) _dm = { huntTick: 1, noiseR: 1, susp: 1, cd: 1, glow: 1 };
+  G.diffHuntTick = _dm.huntTick; G.diffNoiseR = _dm.noiseR; G.diffSusp = _dm.susp;
+  G.diffCd = _dm.cd; G.diffGlow = _dm.glow;
   // v3 resets
   G.stamina = C.STAM_MAX; G.sprinting = false; G.pantT = 0;
   G.nearNote = -1; G.noteOpen = -1; G.angerFlash = 0;
@@ -1623,6 +1662,17 @@ document.addEventListener('keydown', function (e) {
   var code = e.code;
   // Intro: any key skips (the Enter that started it is already consumed).
   if (G.state === 'INTRO') { _finishIntro(); return; }
+  // v5: TITLE difficulty selector — LEFT/RIGHT cycle, ENTER continues.
+  if (G.state === 'TITLE' && (code === 'ArrowLeft' || code === 'ArrowRight') &&
+      typeof DIFFS !== 'undefined') {
+    e.preventDefault();
+    var _di = 0;
+    for (var _k = 0; _k < DIFFS.length; _k++) if (DIFFS[_k].id === G.difficulty) _di = _k;
+    _di = (_di + (code === 'ArrowRight' ? 1 : DIFFS.length - 1)) % DIFFS.length;
+    G.difficulty = DIFFS[_di].id;
+    if (typeof refreshDiffUI === 'function') refreshDiffUI();
+    return;
+  }
   if (code === 'Space' || code === 'ArrowUp' || code === 'ArrowDown' ||
       code === 'ArrowLeft' || code === 'ArrowRight') {
     e.preventDefault();
@@ -1636,23 +1686,27 @@ document.addEventListener('keydown', function (e) {
   }
   if (e.repeat) return;   // actions fire once per press; movement keys stay held
 
+  // v5: brief action lock after any PLAY transition — the key that skipped
+  // the intro (or restarted) must not misfire as sonar/throw/radio.
+  var _actLocked = (typeof G.inputLockT === 'number' && G.inputLockT > 0);
+
   switch (code) {
     case 'Space':
-      if (G.state === 'PLAY' && typeof doSonar3D === 'function') doSonar3D();
+      if (G.state === 'PLAY' && !_actLocked && typeof doSonar3D === 'function') doSonar3D();
       break;
     case 'KeyF':
       // v3: context-sensitive — near a note reads it, else throws.
-      if (G.state === 'PLAY') {
+      if (G.state === 'PLAY' && !_actLocked) {
         if (G.noteOpen >= 0) { _closeNote3D(); }
         else if (G.nearNote >= 0 && typeof openNote3D === 'function') openNote3D(G.nearNote);
         else if (typeof throwFacing3D === 'function') throwFacing3D();
       }
       break;
     case 'KeyQ':
-      if (G.state === 'PLAY' && typeof throwFacing3D === 'function') throwFacing3D();
+      if (G.state === 'PLAY' && !_actLocked && typeof throwFacing3D === 'function') throwFacing3D();
       break;
     case 'KeyE':
-      if (G.state === 'PLAY' && typeof placeRadio3D === 'function') placeRadio3D();
+      if (G.state === 'PLAY' && !_actLocked && typeof placeRadio3D === 'function') placeRadio3D();
       break;
     case 'KeyC':
       if (G.state === 'PLAY') G.player.crouch = !G.player.crouch;
@@ -1677,7 +1731,7 @@ document.addEventListener('keydown', function (e) {
       break;
     case 'KeyM':
       // v4: M opens the tactical map (was mute — mute moved to N).
-      if (G.state === 'PLAY') {
+      if (G.state === 'PLAY' && !_actLocked) {
         if (G.mapOpen) _closeMap3D();
         else if (G.noteOpen < 0 && typeof openMap3D === 'function') openMap3D();
       }
@@ -1745,6 +1799,11 @@ function _finishIntro() {
   _snapCamera();
   if (typeof hideIntroHUD === 'function') hideIntroHUD();
   if (typeof hidePASubtitle === 'function') hidePASubtitle();
+  // v5: flush input + brief action lock — the skip key must never leak into
+  // PLAY as a sonar/throw. (Double-tap skip was misfiring sonar.)
+  for (var k in _held) _held[k] = false;
+  _sprintCode = null; _lastTapCode = null;
+  G.inputLockT = 0.4;
   G.state = 'PLAY';
 }
 
@@ -1809,6 +1868,7 @@ var Lab = {
   },
 };
 
+/* ===== build3d/creature.js ===== */
 /* Echo Chamber 3D — creature.js
  * Creature AI + 3D form. Plain script, no modules.
  * References shared globals C, G, W3, Sfx (world.js / audioui.js own them).
@@ -1924,8 +1984,16 @@ function hasLOS(ax, ay, bx, by) {
 
 // Emit a noise event: flood from (tx,ty); if the creature's tile hears it,
 // queue a stimulus and bump suspicion. Always adds a faint visual ring.
+// v5: stamps G.lastNoiseT (sonar grace = 10s of quiet -> soft ping).
+// v5: difficulty scales the noise radius (diffNoiseR) and the suspicion
+// gain (diffSusp) — EASY dulls the specimen's ears, HARD sharpens them.
 function emitNoise(tx, ty, radius, susp) {
   tx |= 0; ty |= 0;
+  G.lastNoiseT = G.time;
+  var dn = (typeof G.diffNoiseR === 'number') ? G.diffNoiseR : 1;
+  var ds = (typeof G.diffSusp === 'number') ? G.diffSusp : 1;
+  radius = radius * dn;
+  susp = susp * ds;
   var flood = noiseFlood(tx, ty, radius);
   var c = G.creature;
   var cx = Math.floor(c.x), cy = Math.floor(c.y);
@@ -1933,7 +2001,11 @@ function emitNoise(tx, ty, radius, susp) {
     G.noises.push({ tx: tx, ty: ty, susp: susp });
     c.susp = Math.min(C.SUSP_MAX, Math.max(c.susp, susp));
     // Sonar pulse heard by the creature -> HUD "HEARD" flicker (render reads G.heardFlash)
-    if (radius === C.SONAR_NOISE_R && susp === C.PULSE_SUSP) G.heardFlash = 1.2;
+    var isSonar = (Math.abs(radius - C.SONAR_NOISE_R * dn) < 0.01 &&
+                   Math.abs(susp - C.PULSE_SUSP * ds) < 0.01) ||
+                  (Math.abs(radius - C.SONAR_GRACE_R * dn) < 0.01 &&
+                   Math.abs(susp - C.SONAR_GRACE_SUSP * ds) < 0.01);
+    if (isSonar) G.heardFlash = 1.2;
   }
   G.rings.push({ x: tx, y: ty, r: 0, maxR: radius, t: 0, dur: 0.6, kind: 'noise' });
 }
@@ -1959,13 +2031,17 @@ function updateRadios(dt) {
 
 // v4: per-keycard escalation — each keycard makes the creature angrier.
 // G.keys: 0 (calm) .. 3 (furious). Hunt speed +6%/+12%/+18%, LOOK shortens,
-// SEARCH lengthens. v4 rebalance: base HUNT 3.03 t/s (tick 0.33, -21% from
-// 3.85) so player WALK (4.0) outpaces even max escalation (3.58); sprint
-// (5.6) is the guaranteed escape. The creature catches only the cornered.
+// SEARCH lengthens. v5 rebalance: base HUNT 2.6 t/s (tick 0.385) so player
+// WALK (4.0) comfortably outpaces even max escalation (3.06); sprint (5.6)
+// is the guaranteed escape. The creature catches only the cornered.
+// v5: hunts are FALLIBLE — the creature tracks last-known position, and
+// loud noises mid-hunt redirect it (throwables are an escape tool).
 function _escHuntTick() {
   var k = Math.min(3, G.keys || 0);
   var mult = [1, 1.06, 1.12, 1.18][k];
-  return C.C_TICK_HUNT / mult;
+  // v5: difficulty — EASY slows the hunt (longer tick), HARD quickens it.
+  var dh = (typeof G.diffHuntTick === 'number') ? G.diffHuntTick : 1;
+  return C.C_TICK_HUNT / mult * dh;
 }
 function _escLookT() {
   var k = Math.min(3, G.keys || 0);
@@ -2079,7 +2155,7 @@ function _pickWander() {
   c.path = [];
 }
 
-// Called right after a step: arrival handling for INVESTIGATE.
+// Called right after a step: arrival handling for INVESTIGATE (and v5: HUNT).
 function _afterStep() {
   var c = G.creature;
   if (c.cstate === 'INVESTIGATE' && c.tgt && c.path.length === 0) {
@@ -2090,19 +2166,31 @@ function _afterStep() {
     c.cstate = 'LOOK';
     c.lookT = _escLookT();
     c.tickT = 0;
+    return;
+  }
+  // v5: HUNT reached the last-known position with no fresh contact ->
+  // LOOK around briefly, then SEARCH. Hunts end; they don't linger.
+  if (c.cstate === 'HUNT' && c.tgt && c.path.length === 0 &&
+      Math.floor(c.x) === c.tgt.x && Math.floor(c.y) === c.tgt.y) {
+    c.cstate = 'LOOK';
+    c.lookT = _escLookT();
+    c.tickT = 0;
   }
 }
 
 // One movement tick: HUNT re-paths every tick; others step along the path.
+// v5: the hunt is FALLIBLE — it tracks the last-known position (c.tgt),
+// not the live player. Fresh vision or a loud noise refreshes c.tgt;
+// otherwise the creature can lose you. Break line of sight and run.
 function _tickStep() {
   var c = G.creature, p = G.player;
   if (c.cstate === 'HUNT') {
     if (c.susp < C.SUSP_DROP) {
-      c.tgt = { x: Math.floor(p.x), y: Math.floor(p.y) }; // last-known
-      _toSearch();
+      _toSearch();   // lost interest -> wander near last-known
       return;
     }
-    _setPath(Math.floor(p.x), Math.floor(p.y));
+    if (c.tgt) _setPath(c.tgt.x, c.tgt.y);
+    else _setPath(Math.floor(p.x), Math.floor(p.y)); // no intel yet: current pos
   }
   // Stuck wait: do nothing while the 0.5s wait timer runs.
   if (c.cstate !== 'LOOK' && c.cstate !== 'SEARCH' && c.lookT > 0) return;
@@ -2136,11 +2224,18 @@ function updateCreature(dt) {
   c.susp = Math.max(0, c.susp - decay * dt);
 
   // 3. Vision check: dist <= VISION_R + Bresenham LOS -> instant HUNT.
+  // v5: fresh eyes during an active hunt REFRESH the target (last-known pos).
   var dx = p.x - c.x, dy = p.y - c.y;
   var seen = Math.sqrt(dx * dx + dy * dy) <= C.VISION_R &&
     hasLOS(Math.floor(c.x), Math.floor(c.y), Math.floor(p.x), Math.floor(p.y));
   if (seen) {
-    if (c.cstate !== 'HUNT') _enterHunt();
+    if (c.cstate !== 'HUNT') {
+      _enterHunt();
+    } else {
+      c.tgt = { x: Math.floor(p.x), y: Math.floor(p.y) };
+      c.susp = C.SUSP_MAX;
+      c.tickT = 0;
+    }
   } else if (c.cstate !== 'HUNT' && c.susp >= C.SUSP_HUNT) {
     _enterHunt();
   }
@@ -2166,6 +2261,14 @@ function updateCreature(dt) {
     c.tickT = 0;
     _setPath(stim.tx, stim.ty);
     if (c.path.length === 0) _afterStep();
+  } else if (c.cstate === 'HUNT' && stim !== null &&
+             stim.susp >= C.SUSP_INVESTIGATE) {
+    // v5: a loud noise mid-hunt pulls the creature toward the SOUND, not
+    // the player — a thrown lure can redirect a hunt in progress. Escape tool.
+    c.tgt = { x: stim.tx, y: stim.ty };
+    c.susp = Math.min(C.SUSP_MAX, c.susp + 15);
+    c.tickT = 0;
+    _setPath(c.tgt.x, c.tgt.y);
   }
 
   // 5. Generic countdowns (lookT: LOOK pause / SEARCH wander / stuck wait).
@@ -3095,6 +3198,7 @@ function checkCapture3D() {
   if (d < C.CAPTURE_D) Creature.beginTaken();
 }
 
+/* ===== build3d/systems.js ===== */
 /* Echo Chamber 3D — systems.js
  * Sonar, keycards, keycard readers, exit, distractions (throws/radios),
  * expanding 3D rings, and the one-time start map reveal — lab-ified per the
@@ -3184,7 +3288,8 @@ function _s_dispose(obj) {
 function doSonar3D() {
   if (G.state !== 'PLAY' || G.pulseCd > 0) { Sfx.bonk(); return; }
   var pt = _s_playerTile();
-  G.pulseCd = C.SONAR_CD;
+  // v5: difficulty — EASY recharges sonar faster, HARD slower.
+  G.pulseCd = C.SONAR_CD * ((typeof G.diffCd === 'number') ? G.diffCd : 1);
   var R = C.SONAR_REVEAL_R;
   var x0 = Math.max(0, Math.floor(pt.x - R)), x1 = Math.min(C.W - 1, Math.ceil(pt.x + R));
   var y0 = Math.max(0, Math.floor(pt.y - R)), y1 = Math.min(C.H - 1, Math.ceil(pt.y + R));
@@ -3198,7 +3303,13 @@ function doSonar3D() {
   G.rings.push({ x: pt.x, y: pt.y, r: 0, maxR: R, t: 0, dur: 0.9,
                  kind: 'sonar', color: '#4de8ff', _m3d: true });
   _s_spawnSonarPulse(pt.x, pt.y);
-  emitNoise(pt.x, pt.y, C.SONAR_NOISE_R, C.PULSE_SUSP);
+  // v5: sonar grace — 10s of quiet earns a soft ping (r=3/+40). Spamming
+  // sonar, or pinging right after moving, pings loud (r=5/+55). Fair trade.
+  var quietFor = G.time - (G.lastNoiseT || -1e3);
+  var grace = quietFor > C.SONAR_GRACE_T;
+  var nR = grace ? C.SONAR_GRACE_R : C.SONAR_NOISE_R;
+  var nS = grace ? C.SONAR_GRACE_SUSP : C.PULSE_SUSP;
+  emitNoise(pt.x, pt.y, nR, nS);
   G.pulsesUsed++;
   // v4: tactical map intel — a ping marks the creature's last-known tile,
   // but ONLY if it was inside the sonar radius. The map never tracks live.
@@ -3360,30 +3471,38 @@ function updateRings3D(dt) {
 // the dark) plus a mag stripe and a pale chip so it reads as lab equipment
 // up close. Lambert material responds to the sonar pulse's traveling light,
 // so the card's amber glint catches the wavefront. Slow bob + spin.
-// Meshes align with G.keycards by index; hidden when taken.
+// v5 (Tim: "keycard dikh nahi rhai"): the card is bigger, the emissive is
+// far brighter, and each keycard now carries a vertical additive glow beam
+// (floor-to-ceiling light pillar, visible across the dark) plus a subtle
+// pulsing amber point light. Keycards must read from 3-4 tiles away.
+// Meshes/beams/lights align with G.keycards by index; hidden when taken.
 function buildKeycards3D() {
   for (var i = 0; i < W3.keyMeshes.length; i++) _s_dispose(W3.keyMeshes[i]);
-  W3.keyMeshes = [];
+  for (var b = 0; b < W3.keyBeams.length; b++) _s_dispose(W3.keyBeams[b]);
+  for (var l = 0; l < W3.keyLights.length; l++) {
+    if (W3.keyLights[l].parent) W3.keyLights[l].parent.remove(W3.keyLights[l]);
+  }
+  W3.keyMeshes = []; W3.keyBeams = []; W3.keyLights = [];
   for (var k = 0; k < G.keycards.length; k++) {
     var kc = G.keycards[k];
     var c = _s_tileCenter(kc.x, kc.y);
     var grp = new THREE.Group();
     var body = new THREE.Mesh(
-      new THREE.BoxGeometry(0.52, 0.045, 0.34),
-      new THREE.MeshLambertMaterial({ color: 0x6b4a10, emissive: _s_AMBER, emissiveIntensity: 0.75 })
+      new THREE.BoxGeometry(0.7, 0.06, 0.5),
+      new THREE.MeshLambertMaterial({ color: 0x6b4a10, emissive: _s_AMBER, emissiveIntensity: 2.2 })
     );
     // Mag stripe across the top.
     var stripe = new THREE.Mesh(
-      new THREE.BoxGeometry(0.52, 0.014, 0.09),
+      new THREE.BoxGeometry(0.7, 0.016, 0.12),
       new THREE.MeshBasicMaterial({ color: 0x141414 })
     );
-    stripe.position.set(0, 0.026, -0.095);
+    stripe.position.set(0, 0.034, -0.13);
     // Pale contact chip.
     var chip = new THREE.Mesh(
-      new THREE.BoxGeometry(0.09, 0.014, 0.07),
+      new THREE.BoxGeometry(0.12, 0.016, 0.09),
       new THREE.MeshBasicMaterial({ color: 0xE8E4D8 })
     );
-    chip.position.set(-0.15, 0.026, 0.075);
+    chip.position.set(-0.2, 0.034, 0.1);
     grp.add(body);
     grp.add(stripe);
     grp.add(chip);
@@ -3391,20 +3510,52 @@ function buildKeycards3D() {
     grp.userData.phase = k * 1.7; // bob offset per card
     W3.scene.add(grp);
     W3.keyMeshes.push(grp);
+    // Glow beam: additive amber pillar, floor to near-ceiling. depthWrite
+    // off so it never occludes; it reads as a beacon in the dark.
+    var beam = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.16, 0.3, 2.9, 12, 1, true),
+      new THREE.MeshBasicMaterial({ color: _s_AMBER, transparent: true,
+        opacity: 0.16, blending: THREE.AdditiveBlending,
+        side: THREE.DoubleSide, depthWrite: false })
+    );
+    beam.position.set(c.x, 1.55, c.z);
+    beam.userData.phase = k * 2.3;
+    W3.scene.add(beam);
+    W3.keyBeams.push(beam);
+    // Pulsing point light: short range, low intensity — a local warm pool
+    // around the card, not a scene light. (3 keycards = 3 small lights.)
+    var pl = new THREE.PointLight(_s_AMBER, 0.7, 6, 2);
+    pl.position.set(c.x, 1.4, c.z);
+    pl.userData.phase = k * 1.9;
+    W3.scene.add(pl);
+    W3.keyLights.push(pl);
   }
 }
 
 function syncKeycards3D(dt) {
+  // v5: EASY difficulty brightens the keycard glow (guided exploration).
+  var glow = (typeof G.diffGlow === 'number') ? G.diffGlow : 1;
   for (var i = 0; i < W3.keyMeshes.length; i++) {
     var mesh = W3.keyMeshes[i];
     var kc = G.keycards[i];
-    if (!kc) { mesh.visible = false; continue; }
-    mesh.visible = !kc.taken;
-    if (!mesh.visible) continue;
+    var beam = W3.keyBeams[i], pl = W3.keyLights[i];
+    if (!kc || kc.taken) {
+      mesh.visible = false;
+      if (beam) beam.visible = false;
+      if (pl) pl.visible = false;
+      continue;
+    }
+    mesh.visible = true;
+    if (beam) beam.visible = true;
+    if (pl) pl.visible = true;
     // Bob on the fixed-rate game clock; spin is time-scaled (dt), so both
     // read identically at any frame rate.
     mesh.position.y = 1.15 + Math.sin(G.time * 2.2 + mesh.userData.phase) * 0.09;
     mesh.rotation.y += dt * 1.4; // slow spin
+    // Beacon pulse: beam breathes, light throbs. Never fully dark.
+    var pu = 0.5 + 0.5 * Math.sin(G.time * 2.6 + (beam ? beam.userData.phase : 0));
+    if (beam) beam.material.opacity = (0.10 + 0.12 * pu) * glow;
+    if (pl) pl.intensity = (0.45 + 0.45 * pu) * glow;
   }
 }
 
@@ -3846,6 +3997,7 @@ function openNote3D(i) {
   if (typeof Sfx !== 'undefined' && Sfx.paper) Sfx.paper();
 }
 
+/* ===== build3d/audioui.js ===== */
 // Echo Chamber 3D — audio + HUD + screens + tutorial (component: audioui.js)
 // Plain script: reads shared globals C, G, W3 (defined in world.js — never
 // redeclared here). Declares Sfx, Tut, buildHUD, updateHUD, showScreen,
@@ -5169,6 +5321,9 @@ function buildHUD() {
     '  animation: ec3-breathe 2.4s ease-in-out infinite; }',
     '@keyframes ec3-breathe { 0%,100% { opacity: 0.35; } 50% { opacity: 1; } }',
     '.ec3-ctrl { font-size: 13px; letter-spacing: 2px; line-height: 2; margin-top: 26px; }',
+    '.ec3-diff { font-size: 15px; letter-spacing: 4px; margin-top: 24px; line-height: 2; }',
+    '.ec3-diff .ec3-dim { color: #5a6b7a; }',
+    '.ec3-diffdesc { font-size: 11px; letter-spacing: 2px; color: #8A939B; }',
     '.ec3-note { font-size: 11px; letter-spacing: 2px; color: #8a8a8a; margin-top: 22px; }',
     '.ec3-head { font-size: 40px; font-weight: bold; letter-spacing: 12px; margin: 0 0 14px 12px; }',
     '.ec3-cause { font-size: 16px; letter-spacing: 3px; color: #C0392B; margin-bottom: 20px; }',
@@ -5292,10 +5447,14 @@ function buildHUD() {
   rd.innerHTML = 'LAB 7 — ACOUSTIC CONTAINMENT WING<br>' +
     'SENSOR UPLINK <span class="ok">ACTIVE</span> // SPECIMEN <span class="ec3-red">AT LARGE</span>';
   const te = _el('div', 'ec3-enter', d); te.textContent = 'PRESS ENTER';
+  // v5: difficulty selector — LEFT/RIGHT cycle (world.js input), ENTER continues.
+  const df = _el('div', 'ec3-diff', d);
+  df.id = 'ec3-diffrow';
   const tc2 = _el('div', 'ec3-ctrl', d);
   tc2.innerHTML = 'WASD — move · SHIFT — move quietly · C — crouch<br>' +
     'SPACE — sonar pulse (it reveals… but it hears)<br>' +
-    'Q — throw lure · E — drop radio · M — map · N — mute';
+    'Q — throw lure · E — drop radio · M — map · N — mute<br>' +
+    '<span style="color:#5a6b7a">←/→ — difficulty · ENTER — begin</span>';
   _el('div', 'ec3-note', d).textContent = 'Headphones recommended.';
 
   // HOWTO: field protocol.
@@ -5351,6 +5510,25 @@ function buildHUD() {
     _last: { keys: -1, obj: '', cd: -1, th: -1, ra: -1, tut: '\u0000', bands: -1, heard: null, mute: null, vig: -1,
              stam: -1, anger: null, notep: null }
   };
+  // v5: paint the initial difficulty row (NORMAL).
+  if (typeof refreshDiffUI === 'function') refreshDiffUI();
+}
+
+// v5: difficulty selector readout (TITLE screen). Called by buildHUD once
+// and by world.js input on every LEFT/RIGHT cycle. Plain function (hoisted),
+// reads DIFFS + G.difficulty from world.js.
+function refreshDiffUI() {
+  var el = document.getElementById('ec3-diffrow');
+  if (!el || typeof DIFFS === 'undefined') return;
+  var idx = 1; // default NORMAL
+  for (var i = 0; i < DIFFS.length; i++) {
+    if (DIFFS[i].id === G.difficulty) { idx = i; break; }
+  }
+  var D = DIFFS[idx];
+  el.innerHTML = 'DIFFICULTY <span class="ec3-dim">◀</span> ' +
+    '<span class="ec3-amber">' + D.id + '</span> ' +
+    '<span class="ec3-dim">▶</span><br>' +
+    '<span class="ec3-diffdesc">' + D.tag + ' — ' + D.desc + '</span>';
 }
 
 // Refresh every HUD element from G. Cheap: only writes the DOM when a value
@@ -5683,6 +5861,7 @@ function updateScreens() {
   showScreen(s);
 }
 
+/* ===== build3d/main.js ===== */
 /* Echo Chamber 3D — main.js (coordinator-written)
  * Boot + fixed-dt game loop. Concatenated AFTER audioui.js.
  * Plain script, no modules. References: initThree, buildCreatureMesh,
@@ -5695,6 +5874,8 @@ function _playStep3D(dt) {
   G.time += dt;
   if (G.pulseCd > 0) G.pulseCd = Math.max(0, G.pulseCd - dt);
   if (G.heardFlash > 0) G.heardFlash = Math.max(0, G.heardFlash - dt);
+  // v5: action-key lock decay (anti-misfire after PLAY transitions).
+  if (G.inputLockT > 0) G.inputLockT = Math.max(0, G.inputLockT - dt);
   // v3: reading a note freezes the sim (the overlay has the player's eyes).
   if (G.noteOpen >= 0) return;
   // v4: tactical map open freezes the sim too.
