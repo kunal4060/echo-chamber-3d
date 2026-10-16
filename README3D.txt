@@ -16,6 +16,9 @@ SHIFT ............ move quietly (less noise)
 C ................ crouch (quieter still)
 SPACE ............ sonar pulse — reveals nearby walls/objects for 2.5s,
                    BUT the sound may attract the creature (4s cooldown)
+                   TIP: stand still 10s first for a softer "grace" ping
+Double-tap+hold.. sprint (fast but loud, drains stamina)
+  movement key
 Q / F / click .... throw a distraction 4 tiles ahead (3 total)
 E ................ drop a radio lure (2 total, ticks for 12s)
 F (near note) .... read lab notes scattered in the lab
@@ -24,6 +27,12 @@ N ................ mute
 R ................ restart (keycards are kept)
 ENTER ............ start / advance screens
 ESC .............. pause
+
+DIFFICULTY (title screen, LEFT/RIGHT arrows)
+-------------------------------------------
+EASY (GUIDED) .... slower specimen, softer pings, brighter keycards
+NORMAL (STANDARD)  the intended hunt — fair, but it is listening
+HARD (NIGHTMARE) . faster, sharper-eared specimen. For those who like dying.
 
 GOAL
 ----
