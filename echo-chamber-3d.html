@@ -3499,7 +3499,7 @@ function buildCreatureMesh() {
   var rig = new THREE.Group(); // lateral weave / lunge / breathing offsets
   g.add(rig);
 
-  var flesh = new THREE.MeshBasicMaterial({ color: 0x000000 });
+  var flesh = new THREE.MeshBasicMaterial({ color: 0x0d0d10 });  // v8: near-black (was 0x000000 — invisible)
   var boneMat = new THREE.MeshBasicMaterial({ color: 0xCFC7B4 }); // exposed bone
   var rimMat = new THREE.MeshBasicMaterial({ color: 0x140303, side: THREE.BackSide });
   var fleshMeshes = [], boneMeshes = [];
@@ -3789,7 +3789,9 @@ function syncCreatureMesh(dt) {
   }
   _cr.effRung = Math.max(_cr.autoRung, _cr.manualRung);
   var rung = _cr.effRung;
-  var bodyVis = rung >= 3, eyeVis = rung >= 2;
+  // v8: alien visibility fix — eyes ALWAYS burn in the dark (brightness still
+  // scales with suspicion), body shows from rung 2 (was 3). Player asked to see it.
+  var bodyVis = rung >= 2, eyeVis = true;
   for (var fi = 0; fi < _rig.flesh.length; fi++) _rig.flesh[fi].visible = bodyVis;
   // v4: exposed bones read only with the body (rung 3+) — they glint in sonar.
   for (var bi2 = 0; bi2 < _rig.bones.length; bi2++) _rig.bones[bi2].visible = bodyVis;
