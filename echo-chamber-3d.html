@@ -8123,7 +8123,9 @@ function updateScreens() {
       seen: 'It saw you move.',
       cornered: 'You walked into its path.'
     };
-    cause.textContent = causes[G.loseReason] || 'It was always behind you.';
+    // v9: the last thing you hear — its voice, right against your ear.
+    cause.innerHTML = (causes[G.loseReason] || 'It was always behind you.') +
+      '<br><br><span style="color:#c0392b;font-size:17px;letter-spacing:3px;">"gheee... khatm."</span>';
     st.innerHTML = 'KEYCARDS&nbsp;&nbsp;' + G.keys + '/3' +
       '<br>TIME SURVIVED&nbsp;&nbsp;' + _fmtTime(G.time) +
       '<br>SONAR PULSES&nbsp;&nbsp;' + G.pulsesUsed +
