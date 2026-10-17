@@ -594,6 +594,35 @@ function _parseLevel() {
   G.exits.sort(function (a, b) { return _order[a.id] - _order[b.id]; });
   G.player.x = px + 0.5; G.player.y = py + 0.5;
   G.creature.x = cx + 0.5; G.creature.y = cy + 0.5;
+  // v9: snap hardcoded prop anchors to floor on this level's map.
+  // Originals preserved so switching levels re-snaps cleanly.
+  if (!CAMS._orig) {
+    CAMS._orig = CAMS.map(function (c) { return { x: c.x, y: c.y }; });
+    CCTV_ROOM._orig = { x: CCTV_ROOM.x, y: CCTV_ROOM.y };
+  }
+  for (var _ci = 0; _ci < CAMS.length; _ci++) {
+    var _sn = _snapFloor(CAMS._orig[_ci].x, CAMS._orig[_ci].y);
+    CAMS[_ci].x = _sn.x; CAMS[_ci].y = _sn.y;
+  }
+  var _sr = _snapFloor(CCTV_ROOM._orig.x, CCTV_ROOM._orig.y);
+  CCTV_ROOM.x = _sr.x; CCTV_ROOM.y = _sr.y;
+}
+
+// v9: snap a tile to the nearest floor tile (spiral search, max 6).
+// Fixes hardcoded prop positions (notes/logs/cams) on per-level maps.
+function _snapFloor(x, y) {
+  x |= 0; y |= 0;
+  if (x >= 0 && y >= 0 && x < C.W && y < C.H && G.grid[y] && G.grid[y][x] === 0)
+    return { x: x, y: y };
+  for (var r = 1; r <= 6; r++) {
+    for (var dy = -r; dy <= r; dy++) for (var dx = -r; dx <= r; dx++) {
+      if (Math.max(Math.abs(dx), Math.abs(dy)) !== r) continue;
+      var nx = x + dx, ny = y + dy;
+      if (nx >= 0 && ny >= 0 && nx < C.W && ny < C.H && G.grid[ny][nx] === 0)
+        return { x: nx, y: ny };
+    }
+  }
+  return { x: 1, y: 1 };
 }
 
 // v6: speedrun best times, one slot per difficulty, localStorage.
@@ -5351,7 +5380,9 @@ function buildNotes3D() {
   for (var i = 0; i < _noteMeshes.length; i++) _s_dispose(_noteMeshes[i]);
   _noteMeshes = [];
   for (var n = 0; n < NOTES.length; n++) {
-    var c = _s_tileCenter(NOTES[n].x, NOTES[n].y);
+    // v9: snap to floor on this level's map.
+    var _np = (typeof _snapFloor === 'function') ? _snapFloor(NOTES[n].x, NOTES[n].y) : { x: NOTES[n].x, y: NOTES[n].y };
+    var c = _s_tileCenter(_np.x, _np.y);
     var grp = new THREE.Group();
     // A fallen lab tablet: dark slab + faint glowing screen edge.
     var slab = new THREE.Mesh(
@@ -5382,7 +5413,8 @@ function syncNotes3D(dt) {
     // Gentle glow pulse so notes read as interactive in the dark.
     var gl = 0.35 + 0.25 * Math.sin(G.time * 2.5 + m.userData.phase);
     m.userData.screenMat.color.setRGB(0.25 * gl, 0.55 * gl, 0.65 * gl);
-    var dx = NOTES[i].x + 0.5 - p.x, dy = NOTES[i].y + 0.5 - p.y;
+    var _sp = (typeof _snapFloor === 'function') ? _snapFloor(NOTES[i].x, NOTES[i].y) : { x: NOTES[i].x, y: NOTES[i].y };
+    var dx = _sp.x + 0.5 - p.x, dy = _sp.y + 0.5 - p.y;
     var d = Math.sqrt(dx * dx + dy * dy);
     if (d < bestD) { bestD = d; best = i; }
   }
@@ -5431,7 +5463,9 @@ function buildLogs3D() {
   for (var i = 0; i < _logMeshes.length; i++) _s_dispose(_logMeshes[i]);
   _logMeshes = [];
   for (var n = 0; n < AUDIO_LOGS.length; n++) {
-    var c = _s_tileCenter(AUDIO_LOGS[n].x, AUDIO_LOGS[n].y);
+    // v9: snap to floor on this level's map.
+    var _lp = (typeof _snapFloor === 'function') ? _snapFloor(AUDIO_LOGS[n].x, AUDIO_LOGS[n].y) : { x: AUDIO_LOGS[n].x, y: AUDIO_LOGS[n].y };
+    var c = _s_tileCenter(_lp.x, _lp.y);
     var grp = new THREE.Group();
     // Chunky cassette: dark shell + amber stripe + two reel dots.
     var shell = new THREE.Mesh(
@@ -5469,7 +5503,8 @@ function syncLogs3D(dt) {
     // Amber pulse so logs read as interactive (distinct from cyan notes).
     var gl = 0.45 + 0.3 * Math.sin(G.time * 2.1 + m.userData.phase);
     m.userData.stripeMat.color.setRGB(0.85 * gl, 0.55 * gl, 0.12 * gl);
-    var dx = AUDIO_LOGS[i].x + 0.5 - p.x, dy = AUDIO_LOGS[i].y + 0.5 - p.y;
+    var _lsp = (typeof _snapFloor === 'function') ? _snapFloor(AUDIO_LOGS[i].x, AUDIO_LOGS[i].y) : { x: AUDIO_LOGS[i].x, y: AUDIO_LOGS[i].y };
+    var dx = _lsp.x + 0.5 - p.x, dy = AUDIO_LOGS[i].y + 0.5 - p.y;
     var d = Math.sqrt(dx * dx + dy * dy);
     if (d < bestD) { bestD = d; best = i; }
   }
