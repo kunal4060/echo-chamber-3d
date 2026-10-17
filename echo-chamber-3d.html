@@ -1268,9 +1268,10 @@ function _buildHorrorProps(add, geo, mat) {
   }
 }
 
-// v8: Lab.addScratch(tx, ty) — claw marks on a wall face adjacent to the
-// tile the creature just left. FIFO pool (max 36), visual only.
+// v8: Lab.addScratch(tx, ty) — REMOVED (didn't look good). No-op stub kept
+// so any stray callers stay safe.
 function _addScratch(tx, ty) {
+  return;
   if (!_labBuilt || !_scratchMat) return;
   if (_scratches.length >= 36) {
     var old = _scratches.shift();
@@ -3142,10 +3143,6 @@ function _pickWander() {
 // Called right after a step: arrival handling for INVESTIGATE (and v5: HUNT).
 function _afterStep() {
   var c = G.creature;
-  // v8: 22% chance to leave claw marks on a nearby wall after each step.
-  if (typeof Lab !== 'undefined' && Lab.addScratch && Math.random() < 0.22) {
-    try { Lab.addScratch(Math.floor(c.x), Math.floor(c.y)); } catch (e) {}
-  }
   if (c.cstate === 'INVESTIGATE' && c.tgt && c.path.length === 0) {
     if (_radioIndexAt(c.tgt.x, c.tgt.y) >= 0) {
       c.smashT = 1.5; // stand still and smash the radio
