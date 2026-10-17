@@ -145,29 +145,165 @@ const G = {
   speedT: 0,                 // v6 speedrun timer: sec since leaving intro
   bestT: 0,                  // best time for G.difficulty (localStorage)
   newBest: false,            // set on WIN when the record falls
+  level: 0,                  // v9: current level 0..6 (Lab 1..Lab 7)
+  theme: 'lab',              // v9: 'lab' or 'school'
 };
 G.reveal = new Float32Array(C.W * C.H);
 G.reveal.fill(-1e3);         // unrevealed sentinel (avoids a full-map flash at t=0)
 
 // ------------------------------------------------------------- LEVEL ---
-// v6: expanded 19x14. The original 15x11 block is preserved verbatim in the
-// top-left (player/keycards/creature/MAIN exit untouched); the east wing
-// holds the SECURITY CCTV room + VENT exit, the south wing holds SERVICE.
-const LEVEL = [
-  "###################",
-  "#P.....#...#1.#.V.#",
-  "#.#....#..#.#.#...#",
-  "#.#...............#",
-  "#.....C#......#...#",
-  "###.#######.###.###",
-  "#......#.....E#...#",
-  "#.#.........#.....#",
-  "#.#....#....#.#...#",
-  "#2.....#....3...###",
-  "####.#####.####.###",
-  "#.................#",
-  "#.....##..S..##...#",
-  "###################",
+// v9: 7 story-driven levels — Lab 1 (Wake Up) to Lab 7 (The Nest).
+// Each level: unique map, escalating difficulty, one story beat.
+// Research-backed: Amnesia/SOMA structure — main plot unfolds even
+// without optional logs; scope + complexity grow per level.
+const LEVELS = [
+  {
+    name: "LAB 1", sub: "WAKE UP", theme: "lab",
+    story: "You wake on a cold floor. The lights are dead. The facility went silent 72 hours ago. Find 3 keycards. Get out.",
+    diff: { hunt: 2.6, susp: 1.0 },
+    map: [
+      "###################",
+      "#P.....#...#1.#.V.#",
+      "#.#....#..#.#.#...#",
+      "#.#...............#",
+      "#.....C#......#...#",
+      "###.#######.###.###",
+      "#......#.....E#...#",
+      "#.#.........#.....#",
+      "#.#....#....#.#...#",
+      "#2.....#....3...###",
+      "####.#####.####.###",
+      "#.................#",
+      "#.....##..S..##...#",
+      "###################",
+    ],
+  },
+  {
+    name: "LAB 2", sub: "CRYOGENICS", theme: "lab",
+    story: "Frozen pods line the walls. The logs say they were 'volunteers'. The cold slows IT down... but IT is learning.",
+    diff: { hunt: 2.75, susp: 1.1 },
+    map: [
+      "###################",
+      "#P..#.....#.....#V#",
+      "#...#..1..#.###.#.#",
+      "#...#.....#.....#.#",
+      "###.#.#####.##..#.#",
+      "#...#.......C.....#",
+      "#.###.#.#####.#.###",
+      "#.....#.#...#.....#",
+      "#.#####.#.#.#.###.#",
+      "#.#...#..#..#...#.#",
+      "#.#.2.#.....#.3.#.#",
+      "#.#...#####.....#.#",
+      "#.....#..S...E....#",
+      "###################",
+    ],
+  },
+  {
+    name: "LAB 3", sub: "QUARANTINE", theme: "lab",
+    story: "Isolation cells. One log remains: Dr. Vikram volunteered for the acoustic trial. The thing hunting you was human once.",
+    diff: { hunt: 2.9, susp: 1.2 },
+    map: [
+      "###################",
+      "#P.#...#...#..E#.V#",
+      "#..#.#.#.#.#.##.#.#",
+      "##.#.#.#.#.#..#.#.#",
+      "#..#.#.#.#.#.##.#.#",
+      "#.##.#.#.#.#.#.##.#",
+      "#1.....#...C.....3#",
+      "#.####.#####.####.#",
+      "#.#.....#.#.....#.#",
+      "#.#.###.#.#.###.#.#",
+      "#2#.#...#.#...#.#.#",
+      "#.#.#.###.###.#.#.#",
+      "#...#.....S.....#.#",
+      "###################",
+    ],
+  },
+  {
+    name: "LAB 4", sub: "REACTOR", theme: "lab",
+    story: "The reactor is dying. Emergency power only. In the dark, the signal is louder. IT is faster now. Keep moving.",
+    diff: { hunt: 3.05, susp: 1.3 },
+    map: [
+      "###################",
+      "#P......#.....E#.V#",
+      "#.#####.#.#####.#.#",
+      "#.#...#.#.#...#.#.#",
+      "#.#.1...#.#.C.#.#.#",
+      "#.#...#...#...#.#.#",
+      "#.#####.#####.##..#",
+      "#.......#.........#",
+      "#.#####.#.#####.#.#",
+      "#.#...#...#...#.#.#",
+      "#.#.2.#.#.#.3.#...#",
+      "#.#...#.#.#...#.###",
+      "#.....#..S..#.....#",
+      "###################",
+    ],
+  },
+  {
+    name: "BLACKWOOD SCHOOL", sub: "EAST WING", theme: "school",
+    story: "A school. Above the facility. Children's drawings on the walls. They tested the signal here first. God forgive them.",
+    diff: { hunt: 3.15, susp: 1.4 },
+    map: [
+      "###################",
+      "#P...............V#",
+      "#.###.###.###.###.#",
+      "#.#.#.#.#.#.#.#.#E#",
+      "#...#...#...#...#.#",
+      "###.###.###.###.#.#",
+      "#1..#...#...#...#.#",
+      "#.###.###.###.###.#",
+      "#.#...#...#...#...#",
+      "#.#.#.#.#.#.#.#.#.#",
+      "#.#...#...#...#.3.#",
+      "#.###.###.###.###.#",
+      "#2..C.....S.......#",
+      "###################",
+    ],
+  },
+  {
+    name: "LAB 6", sub: "MORGUE", theme: "lab",
+    story: "The dead researchers. The last log is in YOUR handwriting. You helped design the Threnody Protocol. Remember.",
+    diff: { hunt: 3.3, susp: 1.5 },
+    map: [
+      "###################",
+      "#P#.1.#...#.2.#.EV#",
+      "#.#.#.#.#.#.#.#.#.#",
+      "#...#.#.#.#.#.#.#.#",
+      "#####.#.#.#.#.#.#.#",
+      "#.....#.#.#.#.#.#.#",
+      "#.#####.#.#.#.#.#.#",
+      "#.#...#.#.#.#.#.#.#",
+      "#.#.#.#.#.#.#.#.#.#",
+      "#.#.#.#.#.#.#.#.#.#",
+      "#3#.#.#.#C#.#.#.#.#",
+      "#.#.#.#.#.#.#.#.#.#",
+      "#...#...#...#.S...#",
+      "###################",
+    ],
+  },
+  {
+    name: "LAB 7", sub: "THE NEST", theme: "lab",
+    story: "IT nests here. The signal was never contained — you carry it now. One way out. Through the dark. Run.",
+    diff: { hunt: 3.45, susp: 1.65 },
+    map: [
+      "###################",
+      "#P...#.....#....EV#",
+      "#....#..1..#..#...#",
+      "#....#.....#.....##",
+      "#.##.#.#####.##.#.#",
+      "#.##.#.#...#.##.#.#",
+      "#....#...C.#....#.#",
+      "##.#.#.#...#.##.#.#",
+      "#..#.#.#####.#..#.#",
+      "#..#...........#..#",
+      "#.##.##.###.##.##.#",
+      "#2..#..#.....#.3..#",
+      "#...#..#..#..#....#",
+      "#####.##.S.##.#####",
+    ],
+  },
 ];
 
 // ------------------------------------------- v5: difficulty selector --
@@ -427,13 +563,21 @@ function _parseLevel() {
   G.grid = [];
   G.keycards = [];
   G.exits = [];
+  // v9: level data from LEVELS[G.level]; difficulty applied to C.
+  var LV = LEVELS[G.level] || LEVELS[0];
+  G.theme = LV.theme;
+  C.C_HUNT_SPD = LV.diff.hunt;
+  C.C_TICK_HUNT = Math.max(0.28, 0.385 - (LV.diff.hunt - 2.6) * 0.09);
+  // v9: level suspicion multiplier stacks on the difficulty selector's.
+  G.diffSusp = (G._baseDiffSusp || 1) * LV.diff.susp;
+  var LVMAP = LV.map;
   var px = 1, py = 1, cx = 6, cy = 4;
   // v6: three exits — E=MAIN (east), V=VENT (north, security room), S=SERVICE (south).
   var EXIT_DEFS = { E: ['MAIN', 'MAIN EXIT'], V: ['VENT', 'VENT SHAFT'], S: ['SERVICE', 'SERVICE TUNNEL'] };
   for (var y = 0; y < C.H; y++) {
     G.grid[y] = [];
     for (var x = 0; x < C.W; x++) {
-      var ch = LEVEL[y][x];
+      var ch = LVMAP[y][x];
       G.grid[y][x] = (ch === '#') ? 1 : 0;
       if (ch === 'P') { px = x; py = y; }
       else if (ch === 'C') { cx = x; cy = y; }
@@ -537,7 +681,10 @@ function _texHazard() {
 // 4. Sealed concrete: 3000 speckle dots + 4 soft stain blotches.
 function _texConcrete() {
   // v8: cracked, stained concrete floor. 256px maps one 4m tile.
+  // v9: school theme — worn wooden planks.
+  var school = (typeof G !== 'undefined' && G.theme === 'school');
   var c = _newCanvas(256, 256), g = c.getContext('2d');
+  if (!school) {
   g.fillStyle = '#33342f'; g.fillRect(0, 0, 256, 256);
   for (var i = 0; i < 4200; i++) {
     g.fillStyle = _rand() < 0.5 ? 'rgba(0,0,0,0.09)' : 'rgba(200,200,190,0.05)';
@@ -576,6 +723,30 @@ function _texConcrete() {
   for (var t = 0; t < 260; t++) {
     g.fillStyle = 'rgba(' + ((_rand()*60)|0) + ',' + ((_rand()*55)|0) + ',' + ((_rand()*45)|0) + ',0.5)';
     g.fillRect((_rand() * 256) | 0, (_rand() * 256) | 0, 2, 1);
+  }
+  } else {
+    // v9: school — worn wooden planks, dark gaps, scuffed varnish
+    g.fillStyle = '#4a3826'; g.fillRect(0, 0, 256, 256);
+    for (var pl = 0; pl < 256; pl += 32) {
+      var pv = (_rand() * 16 - 8) | 0;
+      g.fillStyle = 'rgb(' + (74 + pv) + ',' + (56 + pv) + ',' + (38 + pv) + ')';
+      g.fillRect(0, pl, 256, 30);
+      g.fillStyle = 'rgba(10,6,3,0.9)'; g.fillRect(0, pl + 30, 256, 2);
+      // plank grain
+      for (var gr = 0; gr < 12; gr++) {
+        g.strokeStyle = 'rgba(30,20,12,' + (0.2 + _rand() * 0.3) + ')';
+        g.lineWidth = 1;
+        var gy = pl + _rand() * 30;
+        g.beginPath(); g.moveTo(0, gy);
+        g.bezierCurveTo(85, gy + _rand() * 6 - 3, 170, gy + _rand() * 6 - 3, 256, gy);
+        g.stroke();
+      }
+      // scuffs
+      for (var sc = 0; sc < 8; sc++) {
+        g.fillStyle = 'rgba(20,14,8,' + (0.2 + _rand() * 0.3) + ')';
+        g.fillRect((_rand() * 256) | 0, pl + ((_rand() * 28) | 0), 3 + ((_rand() * 8) | 0), 2);
+      }
+    }
   }
   return _finishTex(c);
 }
@@ -626,6 +797,8 @@ function _texWallComposite() {
   // v8: grimy abandoned-hospital ceramic tile. 256px maps 4m wide x 3.2m tall.
   // Upper: aged off-white tiles. Mid: institutional green band. Lower: heavy
   // grime gradient + rust + water streaks + missing-tile patches.
+  // v9: school theme — warm cream + dusty chalkboard-blue band.
+  var school = (typeof G !== 'undefined' && G.theme === 'school');
   var c = _newCanvas(256, 256), g = c.getContext('2d');
   var TS = 32; // tile size px
   var x, y, tx, ty;
@@ -633,9 +806,15 @@ function _texWallComposite() {
   for (ty = 0; ty < 256; ty += TS) for (tx = 0; tx < 256; tx += TS) {
     var band = ty < 150 ? 0 : (ty < 178 ? 1 : 2);
     var v = (_rand() * 14 - 7) | 0;
-    if (band === 0) g.fillStyle = 'rgb(' + (206 + v) + ',' + (210 + v) + ',' + (198 + v) + ')';
-    else if (band === 1) g.fillStyle = 'rgb(' + (96 + v) + ',' + (128 + v) + ',' + (112 + v) + ')';
-    else g.fillStyle = 'rgb(' + (158 + v) + ',' + (162 + v) + ',' + (150 + v) + ')';
+    if (!school) {
+      if (band === 0) g.fillStyle = 'rgb(' + (206 + v) + ',' + (210 + v) + ',' + (198 + v) + ')';
+      else if (band === 1) g.fillStyle = 'rgb(' + (96 + v) + ',' + (128 + v) + ',' + (112 + v) + ')';
+      else g.fillStyle = 'rgb(' + (158 + v) + ',' + (162 + v) + ',' + (150 + v) + ')';
+    } else {
+      if (band === 0) g.fillStyle = 'rgb(' + (216 + v) + ',' + (204 + v) + ',' + (176 + v) + ')';
+      else if (band === 1) g.fillStyle = 'rgb(' + (88 + v) + ',' + (110 + v) + ',' + (138 + v) + ')';
+      else g.fillStyle = 'rgb(' + (172 + v) + ',' + (160 + v) + ',' + (138 + v) + ')';
+    }
     g.fillRect(tx, ty, TS, TS);
   }
   // grout lines
@@ -2206,6 +2385,10 @@ function initLevel3D(keepKeys) {
 
   _parseLevel();
 
+  // v9: refresh level-aware HUD labels + show the story beat card.
+  if (typeof _refreshLvlLabels === 'function') _refreshLvlLabels();
+  if (typeof showStoryCard === 'function') showStoryCard();
+
   var p = G.player;
   p.moving = false;
   p.fx = Math.floor(p.x); p.fy = Math.floor(p.y);
@@ -2253,6 +2436,7 @@ function initLevel3D(keepKeys) {
   if (!_dm) _dm = { huntTick: 1, noiseR: 1, susp: 1, cd: 1, glow: 1 };
   G.diffHuntTick = _dm.huntTick; G.diffNoiseR = _dm.noiseR; G.diffSusp = _dm.susp;
   G.diffCd = _dm.cd; G.diffGlow = _dm.glow;
+  G._baseDiffSusp = _dm.susp; // v9: base for level multiplier stacking
   // v3 resets
   G.stamina = C.STAM_MAX; G.sprinting = false; G.pantT = 0;
   G.nearNote = -1; G.noteOpen = -1; G.angerFlash = 0;
@@ -2423,6 +2607,8 @@ function updatePlayer3D(dt) {
   if (_held['KeyA'] || _held['ArrowLeft']) s -= 1;
   var moving = (f !== 0 || s !== 0);
   p.moving = moving;
+  // v9: first movement dismisses the story card.
+  if (moving && typeof _storyDismiss === 'function') _storyDismiss();
 
   if (moving) {
     var sy = Math.sin(p.yaw), cy = Math.cos(p.yaw);
@@ -2682,7 +2868,11 @@ document.addEventListener('keydown', function (e) {
     case 'Enter':
       if (G.state === 'TITLE') { G.state = 'HOWTO'; }
       else if (G.state === 'HOWTO') { startIntro3D(); }
-      else if (G.state === 'WIN') { initLevel3D(false); G.state = 'PLAY'; }
+      else if (G.state === 'WIN') {
+        // v9: next level, or game complete after Lab 7.
+        if (G.level < 6) { G.level++; initLevel3D(false); G.state = 'PLAY'; }
+        else { G.state = 'TITLE'; G.level = 0; }
+      }
       break;
     case 'Escape':
       // v7: stop voice log playback first.
@@ -2705,6 +2895,7 @@ document.addEventListener('keydown', function (e) {
       if (G.state === 'PLAY' || G.state === 'PAUSE' || G.state === 'LOSE') {
         initLevel3D(true); G.state = 'PLAY';
       } else if (G.state === 'WIN') {
+        // v9: R replays the SAME level; Enter advances.
         initLevel3D(false); G.state = 'PLAY';
       }
       break;
@@ -6853,7 +7044,7 @@ const Tut = {
   text() {
     switch (this.step) {
       case 0:
-        return "LAB 7 // WASD — MOVE · SHIFT — MOVE QUIETLY";
+        return _lvlName() + " // WASD — MOVE · SHIFT — MOVE QUIETLY";
       case 1:
         return "SPACE — SONAR PULSE // IT MAPS THE LAB · IT HEARS YOU";
       case 2:
@@ -7095,7 +7286,7 @@ function buildHUD() {
   const objLine = _el('div', 'ec3-obj', tc);
   const timerLine = _el('div', 'ec3-timer', tc);      // v6: speedrun clock
   const logLine = _el('div', 'ec3-logline', tc);      // v6: audio logs found
-  _el('div', 'ec3-objsub', tc).textContent = 'LAB 7 // ACOUSTIC CONTAINMENT';
+  _el('div', 'ec3-objsub', tc).id = 'ec3-objsub';
 
   // --- bottom-left: access badges (keycards) --------------------------------
   const bl = _el('div', 'ec3-hud ec3-bl', document.body);
@@ -7199,7 +7390,7 @@ function buildHUD() {
   // --- v4: tactical map overlay -------------------------------------------------
   const mapOv = _el('div', 'ec3-mapov', document.body);
   const mapTitle = _el('div', 'ec3-maptitle', mapOv);
-  mapTitle.textContent = 'LAB 7 — TACTICAL MAP';
+  mapTitle.id = 'ec3-mapTitle';
   const mapCard = _el('div', 'ec3-mapcard', mapOv);
   const mapCanvas = document.createElement('canvas');
   mapCanvas.width = 640; mapCanvas.height = 500;
@@ -7222,7 +7413,7 @@ function buildHUD() {
   _el('div', 'ec3-title', d).textContent = 'ECHO CHAMBER 3D';
   _el('div', 'ec3-tag', d).textContent = '"Every ping is a whisper. It is listening."';
   const rd = _el('div', 'ec3-readout', d);
-  rd.innerHTML = 'LAB 7 — ACOUSTIC CONTAINMENT WING<br>' +
+  rd.id = 'ec3-introtitle'; rd.innerHTML = _lvlFull() + '<br>' +
     'SENSOR UPLINK <span class="ok">ACTIVE</span> // SPECIMEN <span class="ec3-red">AT LARGE</span>';
   const te = _el('div', 'ec3-enter', d); te.textContent = 'PRESS ENTER';
   // v5: difficulty selector — LEFT/RIGHT cycle (world.js input), ENTER continues.
@@ -7265,9 +7456,9 @@ function buildHUD() {
   // WIN: ESCAPED + stats (filled in updateScreens).
   d = screens.WIN;
   _el('div', 'ec3-head ec3-amber', d).textContent = 'ESCAPED';
-  _el('div', 'ec3-tag', d).textContent = 'LAB 7 BREACH COMPLETE';
+  _el('div', 'ec3-tag', d).id = 'ec3-wintag';
   _el('div', 'ec3-stats', d);
-  const we = _el('div', 'ec3-enter', d); we.textContent = 'R — PLAY AGAIN';
+  const we = _el('div', 'ec3-enter', d); we.id = 'ec3-winenter'; we.textContent = 'ENTER — NEXT LAB · R — REPLAY';
   we.style.marginTop = '26px';
 
   // LOSE: TAKEN + cause line (filled in updateScreens) + stats + retry.
@@ -7363,6 +7554,9 @@ function updateHUD() {
   if (!_hud) return;
   const L = _hud._last;
   const inPlay = G.state === 'PLAY';
+
+  // v9: story card tick (dt approx from rAF — use 1/60).
+  if (typeof _storyTick === 'function') _storyTick(1 / 60);
 
   // v4: tactical map stays live while open (fading "?" ping marker).
   if (G.mapOpen && typeof _drawMap === 'function') _drawMap();
@@ -7733,6 +7927,72 @@ function hidePASubtitle() {
 
 // Sync overlays with G.state. Called from updateHUD each frame; also
 // refreshes WIN/LOSE content when those screens are up.
+// v9: level-aware names. LEVELS lives in world.js; G.level is 0-based.
+function _lvl() {
+  try {
+    if (typeof LEVELS !== 'undefined' && LEVELS[G.level]) return LEVELS[G.level];
+  } catch (e) {}
+  return { name: 'LAB 1', sub: 'WAKE UP', story: '' };
+}
+function _lvlName() { return _lvl().name; }
+function _lvlFull() { return _lvl().name + ' — ' + _lvl().sub + ' WING'; }
+// v9: refresh dynamic level labels (call on level load + WIN show).
+function _refreshLvlLabels() {
+  try {
+    var lv = _lvl();
+    var o = document.getElementById('ec3-objsub');
+    if (o) o.textContent = lv.name + ' // ' + lv.sub;
+    var mt = document.getElementById('ec3-mapTitle');
+    if (mt) mt.textContent = lv.name + ' — TACTICAL MAP';
+    var it = document.getElementById('ec3-introtitle');
+    if (it) it.innerHTML = _lvlFull() + '<br>' + (it.innerHTML.split('<br>').slice(1).join('<br>') || '');
+    var wt = document.getElementById('ec3-wintag');
+    if (wt) wt.textContent = lv.name + ' BREACH COMPLETE';
+    var we2 = document.getElementById('ec3-winenter');
+    if (we2) {
+      var last = (typeof G !== 'undefined' && G.level >= 6);
+      we2.textContent = last ? 'ENTER — TITLE · R — REPLAY' : 'ENTER — NEXT LAB · R — REPLAY';
+    }
+  } catch (e) {}
+}
+
+// v9: story beat card — shown briefly at each level start. Dismiss on move/keys.
+var _storyCard = null, _storyT = 0;
+function showStoryCard() {
+  try {
+    var lv = _lvl();
+    if (_storyCard) { _storyCard.remove(); _storyCard = null; }
+    var d = document.createElement('div');
+    d.id = 'ec3-story';
+    d.style.cssText = 'position:fixed;left:50%;top:38%;transform:translate(-50%,-50%);' +
+      'max-width:520px;padding:28px 34px;background:rgba(4,8,10,0.92);' +
+      'border:1px solid rgba(255,170,60,0.35);color:#e8e2d4;z-index:60;' +
+      'font-family:monospace;text-align:center;transition:opacity 0.8s;';
+    d.innerHTML = '<div style="color:#ffaa3c;font-size:13px;letter-spacing:4px;margin-bottom:10px;">' +
+      lv.name + '</div>' +
+      '<div style="font-size:18px;letter-spacing:2px;margin-bottom:14px;color:#fff;">' +
+      lv.sub + '</div>' +
+      '<div style="font-size:13px;line-height:1.7;color:#b8b2a4;">' + lv.story + '</div>' +
+      '<div style="margin-top:16px;font-size:11px;color:#6a655a;letter-spacing:2px;">MOVE TO CONTINUE</div>';
+    document.body.appendChild(d);
+    _storyCard = d; _storyT = 0;
+  } catch (e) {}
+}
+function _storyTick(dt) {
+  if (!_storyCard) return;
+  _storyT += dt;
+  // fade after 6s or on first movement input
+  if (_storyT > 6) {
+    _storyCard.style.opacity = '0';
+    var el = _storyCard;
+    setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 900);
+    _storyCard = null;
+  }
+}
+function _storyDismiss() {
+  if (_storyCard) { _storyT = 99; _storyTick(0); }
+}
+
 function updateScreens() {
   if (!_hud) return;
   const s = G.state;
