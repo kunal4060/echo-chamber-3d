@@ -2865,8 +2865,31 @@ document.addEventListener('keydown', function (e) {
       // v6: Z toggles crouch (moved from C).
       if (G.state === 'PLAY') G.player.crouch = !G.player.crouch;
       break;
+    // v9: level select — number keys 1-7 jump, arrows move.
+    case 'Digit1': case 'Digit2': case 'Digit3': case 'Digit4':
+    case 'Digit5': case 'Digit6': case 'Digit7':
+      if (G.state === 'LEVELS' && typeof _lvlSel !== 'undefined') {
+        _lvlSel = parseInt(e.code.slice(5)) - 1;
+        if (typeof _renderLvls === 'function') _renderLvls();
+      }
+      break;
+    case 'ArrowUp':
+      if (G.state === 'LEVELS' && typeof _lvlSel !== 'undefined') {
+        _lvlSel = (_lvlSel + 6) % 7;
+        if (typeof _renderLvls === 'function') _renderLvls();
+        if (e.preventDefault) e.preventDefault();
+      }
+      break;
+    case 'ArrowDown':
+      if (G.state === 'LEVELS' && typeof _lvlSel !== 'undefined') {
+        _lvlSel = (_lvlSel + 1) % 7;
+        if (typeof _renderLvls === 'function') _renderLvls();
+        if (e.preventDefault) e.preventDefault();
+      }
+      break;
     case 'Enter':
-      if (G.state === 'TITLE') { G.state = 'HOWTO'; }
+      if (G.state === 'TITLE') { G.state = 'LEVELS'; if (typeof _renderLvls === 'function') _renderLvls(); }
+      else if (G.state === 'LEVELS') { if (typeof _lvlConfirm === 'function') _lvlConfirm(); }
       else if (G.state === 'HOWTO') { startIntro3D(); }
       else if (G.state === 'WIN') {
         // v9: next level, or game complete after Lab 7.
@@ -2881,6 +2904,7 @@ document.addEventListener('keydown', function (e) {
       if (G.camOpen >= 0 && typeof closeCam3D === 'function') { closeCam3D(); }
       else if (G.mapOpen) { _closeMap3D(); }
       else if (G.noteOpen >= 0) { _closeNote3D(); }
+      else if (G.state === 'LEVELS') G.state = 'TITLE';
       else if (G.state === 'PLAY') G.state = 'PAUSE';
       else if (G.state === 'PAUSE') G.state = 'PLAY';
       break;
@@ -7401,7 +7425,7 @@ function buildHUD() {
 
   // --- screens ------------------------------------------------------------------
   const screens = {};
-  const names = ['TITLE', 'HOWTO', 'PAUSE', 'WIN', 'LOSE'];
+  const names = ['TITLE', 'LEVELS', 'HOWTO', 'PAUSE', 'WIN', 'LOSE'];
   for (let i = 0; i < names.length; i++) {
     const s = _el('div', 'ec3-screen', document.body);
     s.id = 'ec3-screen-' + names[i];
@@ -7424,10 +7448,21 @@ function buildHUD() {
     'SPACE — sonar pulse (it reveals… but it hears)<br>' +
     'F — flashlight · Q — throw lure · G — drop radio · E — read<br>' +
     'C — security cameras · X — adrenaline · M — map · N — mute<br>' +
-    '<span style="color:#5a6b7a">←/→ — difficulty · ENTER — begin</span>';
+    '<span style="color:#5a6b7a">←/→ — difficulty · ENTER — select lab</span>';
   const bt = _el('div', 'ec3-note', d);
   bt.id = 'ec3-bestline';
   _el('div', 'ec3-note', d).textContent = 'Headphones recommended.';
+
+  // v9: LEVELS — level select. 7 story levels, all unlocked.
+  d = screens.LEVELS;
+  _el('div', 'ec3-head ec3-amber', d).textContent = 'SELECT LAB';
+  _el('div', 'ec3-tag', d).textContent = 'THE THRENODY PROTOCOL — 7 LEVELS';
+  const lvWrap = _el('div', 'ec3-levels', d);
+  lvWrap.id = 'ec3-lvwrap';
+  lvWrap.style.cssText = 'display:flex;flex-direction:column;gap:8px;margin:22px auto;max-width:520px;';
+  const lvHint = _el('div', 'ec3-enter', d);
+  lvHint.id = 'ec3-lvhint'; lvHint.textContent = '1–7 — SELECT · ENTER — BEGIN · ESC — BACK';
+  lvHint.style.marginTop = '18px';
 
   // HOWTO: field protocol.
   d = screens.HOWTO;
@@ -7721,7 +7756,7 @@ function showScreen(name) {
   if (!_hud) return;
   if (name === _screenName) return;
   _screenName = name;
-  const names = ['TITLE', 'HOWTO', 'PAUSE', 'WIN', 'LOSE'];
+  const names = ['TITLE', 'LEVELS', 'HOWTO', 'PAUSE', 'WIN', 'LOSE'];
   for (let i = 0; i < names.length; i++) {
     _hud.screens[names[i]].classList.toggle('on', names[i] === name);
   }
@@ -7991,6 +8026,42 @@ function _storyTick(dt) {
 }
 function _storyDismiss() {
   if (_storyCard) { _storyT = 99; _storyTick(0); }
+}
+
+
+// v9: level select state + rendering.
+var _lvlSel = 0;
+function _renderLvls() {
+  try {
+    var w = document.getElementById('ec3-lvwrap');
+    if (!w || typeof LEVELS === 'undefined') return;
+    w.innerHTML = '';
+    for (var i = 0; i < LEVELS.length; i++) {
+      var lv = LEVELS[i];
+      var skulls = '●'.repeat(i + 1) + '○'.repeat(6 - i);
+      var row = document.createElement('div');
+      var sel = (i === _lvlSel);
+      row.style.cssText = 'display:flex;align-items:center;gap:14px;padding:10px 16px;' +
+        'border:1px solid ' + (sel ? '#ffaa3c' : 'rgba(120,140,160,0.25)') + ';' +
+        'background:' + (sel ? 'rgba(255,170,60,0.08)' : 'rgba(10,16,20,0.6)') + ';' +
+        'cursor:pointer;font-family:monospace;';
+      row.innerHTML =
+        '<span style="color:' + (sel ? '#ffaa3c' : '#5a6b7a') + ';font-size:15px;width:24px;">' + (i + 1) + '</span>' +
+        '<span style="flex:1;text-align:left;"><span style="color:#e8e2d4;font-size:14px;letter-spacing:1px;">' + lv.name + '</span>' +
+        '<span style="color:#6a655a;font-size:11px;margin-left:10px;">' + lv.sub + '</span></span>' +
+        '<span style="color:#c0392b;font-size:10px;letter-spacing:2px;">' + skulls + '</span>' +
+        (lv.theme === 'school' ? '<span style="color:#7fb3d5;font-size:10px;">SCHOOL</span>' : '');
+      (function (idx) {
+        row.onclick = function () { _lvlSel = idx; _renderLvls(); _lvlConfirm(); };
+      })(i);
+      w.appendChild(row);
+    }
+  } catch (e) {}
+}
+function _lvlConfirm() {
+  try {
+    if (typeof G !== 'undefined') { G.level = _lvlSel; G.state = 'HOWTO'; }
+  } catch (e) {}
 }
 
 function updateScreens() {
