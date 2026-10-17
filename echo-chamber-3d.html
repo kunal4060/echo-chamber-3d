@@ -233,6 +233,10 @@ var _roomAnchors = [];        // 9 room light anchor world positions
 var _roomPool = [];           // 4 PointLights (nearest-4 active; flicker borrows one)
 var _flickSpots = [];         // 3 flickering-tube tile world positions
 var _flickCones = [];         // v8: volumetric cone meshes under flicker tubes
+var _wires = [];                // v8: hanging wires {mesh, phase, speed}
+var _scratches = [];            // v8: claw-mark decal pool (FIFO, max 36)
+var _scratchMat = null;
+var _glimpseMesh = null, _glimpseMat = null, _glimpseT = 0, _glimpseNext = 50; // v8
 var _flickTubeMat = null;     // shared emissive material for flicker troffers
 var _flickNear = false;       // player within buzz/light range of a flicker tube
 var _flickWX = 0, _flickWZ = 0; // nearest flicker tube world pos (for buzz)
@@ -842,6 +846,57 @@ function _texPoster(variant) {
   return _finishTex(c);
 }
 
+// v8: corridor-glimpse silhouette — tall thin humanoid, pure dark, soft edges.
+function _texGlimpse() {
+  var c = _newCanvas(128, 256), g = c.getContext('2d');
+  g.clearRect(0, 0, 128, 256);
+  // head
+  var hg = g.createRadialGradient(64, 42, 2, 64, 42, 26);
+  hg.addColorStop(0, 'rgba(5,5,8,0.96)');
+  hg.addColorStop(1, 'rgba(5,5,8,0)');
+  g.fillStyle = hg;
+  g.beginPath(); g.arc(64, 42, 26, 0, 7); g.fill();
+  // torso: tapered dark mass
+  var tg = g.createLinearGradient(0, 60, 0, 256);
+  tg.addColorStop(0, 'rgba(5,5,8,0.95)');
+  tg.addColorStop(0.7, 'rgba(5,5,8,0.85)');
+  tg.addColorStop(1, 'rgba(5,5,8,0)');
+  g.fillStyle = tg;
+  g.beginPath();
+  g.moveTo(48, 62); g.lineTo(80, 62);
+  g.lineTo(88, 180); g.lineTo(74, 250);
+  g.lineTo(54, 250); g.lineTo(40, 180);
+  g.closePath(); g.fill();
+  // long arms
+  g.fillStyle = 'rgba(5,5,8,0.9)';
+  g.fillRect(34, 80, 10, 110);
+  g.fillRect(84, 80, 10, 118);
+  return _finishTex(c);
+}
+// v8: claw scratch marks — 4 diagonal slashes, pale gouges on dark.
+function _texScratch() {
+  var c = _newCanvas(128, 128), g = c.getContext('2d');
+  g.clearRect(0, 0, 128, 128);
+  for (var i = 0; i < 4; i++) {
+    var x0 = 18 + i * 26 + (_rand() * 8 - 4);
+    g.strokeStyle = 'rgba(210,205,190,' + (0.55 + _rand() * 0.2) + ')';
+    g.lineWidth = 3 + _rand() * 2;
+    g.lineCap = 'round';
+    g.beginPath();
+    g.moveTo(x0, 12 + _rand() * 10);
+    g.quadraticCurveTo(x0 - 14, 64, x0 - 6 + (_rand() * 10 - 5), 112);
+    g.stroke();
+    // dark groove shadow beside each slash
+    g.strokeStyle = 'rgba(10,8,6,0.6)';
+    g.lineWidth = 2;
+    g.beginPath();
+    g.moveTo(x0 + 4, 14 + _rand() * 10);
+    g.quadraticCurveTo(x0 - 10, 64, x0 - 2, 110);
+    g.stroke();
+  }
+  return _finishTex(c);
+}
+
 function _buildLabTextures() {
   _tex.brushed = _texBrushed();
   _tex.hazard = _texHazard();
@@ -859,6 +914,8 @@ function _buildLabTextures() {
   _tex.poster0 = _texPoster(0);
   _tex.poster1 = _texPoster(1);
   _tex.poster2 = _texPoster(2);
+  _tex.glimpse = _texGlimpse();
+  _tex.scratch = _texScratch();
   // v4: emergency + lab realism signage
   _tex.exitSign = _texExitSign();
   _tex.clock = _texClock();
@@ -881,6 +938,8 @@ function _disposeLab() {
   for (var li = 0; li < _roomPool.length; li++)
     if (W3.scene) W3.scene.remove(_roomPool[li]);
   _labGroup = null; _dust = null; _burstPts = null; _burst = null; _flickCones = [];
+  _wires = []; _scratches = []; _scratchMat = null;
+  _glimpseMesh = null; _glimpseMat = null; _glimpseT = 0; _glimpseNext = 50;
   _roomPool = []; _roomAnchors = []; _flickSpots = [];
   _flickTubeMat = null; _exitDotMat = null;
   _labBuilt = false;
@@ -908,6 +967,8 @@ function _buildLabVisuals() {
   _tapeMat = mat(new THREE.MeshBasicMaterial({ map: _tex.tape, side: THREE.DoubleSide }));
   _ceilMat = mat(new THREE.MeshLambertMaterial({ map: _tex.ceil }));
   _flickTubeMat = mat(new THREE.MeshBasicMaterial({ color: 0xD8E8C0 }));
+  _scratchMat = mat(new THREE.MeshBasicMaterial({
+    map: _tex.scratch, transparent: true, opacity: 0.9, depthWrite: false }));
 
   // ---- dropped ceiling @ 2.6 m: acoustic-tile grid over the whole map ----
   var ceil = new THREE.Mesh(geo(new THREE.PlaneGeometry(60, 44)), _ceilMat);
@@ -1145,6 +1206,47 @@ function _buildHorrorProps(add, geo, mat) {
     m.position.set(c.x + (_rand() - 0.5), 0.018, c.z + (_rand() - 0.5));
     add(m);
   }
+  // ---- v8: hanging wires — catenary tubes from the ceiling, gentle sway ----
+  var wireMat = mat(new THREE.MeshLambertMaterial({ color: 0x1c1a16 }));
+  var wireMat2 = mat(new THREE.MeshLambertMaterial({ color: 0x2a241c }));
+  var wireCount = 0, wireGuard = 0;
+  while (wireCount < 14 && wireGuard++ < 400) {
+    var wx = (_rand() * C.W) | 0, wy = (_rand() * C.H) | 0;
+    if (G.grid[wy][wx] !== 0) continue;
+    var wc = worldFromTile(wx, wy);
+    var sx = wc.x + (_rand() - 0.5) * 2, sz = wc.z + (_rand() - 0.5) * 2;
+    var sag = 0.5 + _rand() * 0.5;
+    var ex = sx + (_rand() - 0.5) * 1.6, ez = sz + (_rand() - 0.5) * 1.6;
+    var curve = new THREE.CatmullRomCurve3([
+      new THREE.Vector3(sx, 2.62, sz),
+      new THREE.Vector3((sx + ex) / 2, 2.62 - sag, (sz + ez) / 2),
+      new THREE.Vector3(ex, 2.62 - sag * 0.4, ez)
+    ]);
+    var wm = new THREE.Mesh(
+      geo(new THREE.TubeGeometry(curve, 12, 0.022, 5)),
+      _rand() < 0.5 ? wireMat : wireMat2);
+    // pivot at ceiling anchor for sway
+    var pivot = new THREE.Group();
+    pivot.position.set(sx, 2.62, sz);
+    wm.position.set(-sx, -2.62, -sz);
+    wm.position.add(new THREE.Vector3(sx, 2.62, sz));
+    // simpler: store mesh + phase, sway via rotation around anchor
+    var holder = new THREE.Group();
+    holder.position.set(sx, 2.62, sz);
+    wm.position.set(0, 0, 0);
+    // rebuild curve relative to holder
+    var rcurve = new THREE.CatmullRomCurve3([
+      new THREE.Vector3(0, 0, 0),
+      new THREE.Vector3((ex - sx) / 2, -sag, (ez - sz) / 2),
+      new THREE.Vector3(ex - sx, -sag * 0.4, ez - sz)
+    ]);
+    wm.geometry.dispose();
+    wm.geometry = geo(new THREE.TubeGeometry(rcurve, 12, 0.022, 5));
+    holder.add(wm);
+    add(holder);
+    _wires.push({ holder: holder, phase: _rand() * 6.28, speed: 0.5 + _rand() * 0.7 });
+    wireCount++;
+  }
   // ---- volumetric-feel light cones under flicker tubes ----
   var coneG = geo(new THREE.CylinderGeometry(0.3, 1.7, 2.5, 12, 1, true));
   var coneMat = mat(new THREE.MeshBasicMaterial({
@@ -1163,6 +1265,104 @@ function _buildHorrorProps(add, geo, mat) {
     m = new THREE.Mesh(washG, redWashMat);
     m.position.set(c.x, 1.5, c.z - 1.9);
     add(m);
+  }
+}
+
+// v8: Lab.addScratch(tx, ty) — claw marks on a wall face adjacent to the
+// tile the creature just left. FIFO pool (max 36), visual only.
+function _addScratch(tx, ty) {
+  if (!_labBuilt || !_scratchMat) return;
+  if (_scratches.length >= 36) {
+    var old = _scratches.shift();
+    if (old.parent) old.parent.remove(old);
+  }
+  var DIRS = [{dx:0,dy:1,ry:0},{dx:0,dy:-1,ry:Math.PI},
+              {dx:1,dy:0,ry:Math.PI/2},{dx:-1,dy:0,ry:-Math.PI/2}];
+  // prefer a wall face toward the tile (creature brushed past it)
+  var opts = [];
+  for (var d = 0; d < 4; d++) {
+    var nx = tx + DIRS[d].dx, ny = ty + DIRS[d].dy;
+    if (nx >= 0 && ny >= 0 && nx < C.W && ny < C.H && G.grid[ny][nx] === 1)
+      opts.push(d);
+  }
+  if (!opts.length) return;
+  d = opts[(_rand() * opts.length) | 0];
+  var wc = worldFromTile(nx, ny);
+  var m = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.1, 1.1),
+    _scratchMat);
+  m.position.set(
+    wc.x - DIRS[d].dx * (C.TILE3D / 2 + 0.04),
+    1.0 + _rand() * 0.9,
+    wc.z - DIRS[d].dy * (C.TILE3D / 2 + 0.04));
+  m.rotation.y = DIRS[d].ry + Math.PI; // face back toward the tile
+  m.rotation.z = (_rand() - 0.5) * 0.3;
+  _labGroup.add(m);
+  _track(m.geometry);
+  _scratches.push(m);
+}
+
+// v8: corridor glimpse — 1-second silhouette at a corridor end, then gone.
+function _glimpseTick(dt) {
+  if (!_labBuilt || G.state !== 'PLAY') return;
+  _glimpseNext -= dt;
+  if (_glimpseT <= 0 && _glimpseNext <= 0) {
+    // only when the creature is NOT hunting (avoid confusion), player moving
+    var cst = (G.creature && G.creature.cstate) || '';
+    if (cst !== 'HUNT' && cst !== 'INVESTIGATE') {
+      var p = G.player;
+      // tile 6-9 ahead in facing direction with LOS
+      var fx = Math.round(Math.cos(p.yaw)), fy = Math.round(Math.sin(p.yaw));
+      // yaw: 0 = +x (east). Use facing vector properly:
+      var dx = Math.cos(p.yaw), dz = Math.sin(p.yaw);
+      var found = null;
+      for (var dist = 9; dist >= 6 && !found; dist--) {
+        var gx = Math.floor(p.x + dx * dist), gy = Math.floor(p.y + dz * dist);
+        if (gx < 0 || gy < 0 || gx >= C.W || gy >= C.H) continue;
+        if (G.grid[gy][gx] !== 0) continue;
+        // LOS check: simple step ray
+        var blocked = false;
+        for (var s = 1; s < dist; s++) {
+          var sx = Math.floor(p.x + dx * s), sy = Math.floor(p.y + dz * s);
+          if (sx < 0 || sy < 0 || sx >= C.W || sy >= C.H || G.grid[sy][sx] === 1) {
+            blocked = true; break;
+          }
+        }
+        if (!blocked) found = { x: gx, y: gy };
+      }
+      if (found) {
+        var wc = worldFromTile(found.x, found.y);
+        if (!_glimpseMesh) {
+          _glimpseMat = new THREE.MeshBasicMaterial({
+            map: _tex.glimpse, transparent: true, opacity: 0,
+            depthWrite: false });
+          _track(_glimpseMat);
+          _glimpseMesh = new THREE.Mesh(
+            new THREE.PlaneGeometry(1.1, 2.2), _glimpseMat);
+          _track(_glimpseMesh.geometry);
+          _labGroup.add(_glimpseMesh);
+        }
+        _glimpseMesh.position.set(wc.x, 1.1, wc.z);
+        _glimpseMesh.visible = true;
+        _glimpseT = 1.0; // 1 second of dread
+        if (typeof Sfx !== 'undefined' && Sfx._whisper) {
+          try { Sfx._whisper(); } catch (e) {}
+        }
+      }
+    }
+    _glimpseNext = 50 + Math.random() * 40; // 50-90s
+  }
+  if (_glimpseT > 0 && _glimpseMesh) {
+    _glimpseT -= dt;
+    // face the player (billboard yaw only)
+    var dxp = G.player.x * C.TILE3D - _glimpseMesh.position.x;
+    var dzp = G.player.y * C.TILE3D - _glimpseMesh.position.z;
+    _glimpseMesh.rotation.y = Math.atan2(dxp, dzp);
+    // fade in 0.2s, hold 0.6s, fade out 0.2s
+    var t = 1.0 - _glimpseT;
+    var op = t < 0.2 ? t / 0.2 : (t > 0.8 ? (1.0 - t) / 0.2 : 1);
+    _glimpseMat.opacity = Math.max(0, Math.min(1, op)) * 0.92;
+    if (_glimpseT <= 0) _glimpseMesh.visible = false;
   }
 }
 
@@ -1688,7 +1888,20 @@ function syncTorch3D(dt) {
       W3.camera.getWorldDirection(dir);
       W3.torchTarget.position.set(cp.x + dir.x * 10, cp.y + dir.y * 10, cp.z + dir.z * 10);
       // Warm pool, steady with a faint mains flicker.
-      W3.torch.intensity = 2.4 + 0.12 * Math.sin(G.time * 31.0);
+      // v8: creature proximity interference — the beam stutters and dims.
+      var _ti = 2.4 + 0.12 * Math.sin(G.time * 31.0);
+      if (G.creature && G.state === 'PLAY') {
+        var _tdx = G.creature.x - G.player.x, _tdz = G.creature.y - G.player.y;
+        var _td = Math.sqrt(_tdx * _tdx + _tdz * _tdz);
+        if (_td < C.PROX_FLICK_R) {
+          var _tp = 1 - _td / C.PROX_FLICK_R; // 0..1
+          var _fl = Math.sin(G.time * 47.0) * Math.sin(G.time * 31.7);
+          _ti *= (1 - _tp * 0.55 * (0.5 + 0.5 * _fl));
+          // violent dropouts when very close
+          if (_tp > 0.7 && Math.sin(G.time * 13.3) > 0.86) _ti *= 0.25;
+        }
+      }
+      W3.torch.intensity = _ti;
     }
   }
   // Battery: drain while actually lit, slow recharge while dark.
@@ -1859,6 +2072,13 @@ function _labTick(dt) {
   for (var _ci = 0; _ci < _flickCones.length; _ci++) {
     _flickCones[_ci].material.opacity = 0.055 * tb;
   }
+  // v8: hanging wires sway gently; corridor glimpse timer.
+  for (var _wi = 0; _wi < _wires.length; _wi++) {
+    var _w = _wires[_wi];
+    _w.holder.rotation.x = Math.sin(G.time * _w.speed + _w.phase) * 0.07;
+    _w.holder.rotation.z = Math.cos(G.time * _w.speed * 0.8 + _w.phase) * 0.07;
+  }
+  _glimpseTick(dt);
 
   // Flickering monitor rolling band (own fixed-rate clock).
   _monAcc += dt;
@@ -2074,6 +2294,8 @@ function initLevel3D(keepKeys) {
 
   // v3: a blacked-out master bus must never leak into the next run.
   if (typeof Sfx !== 'undefined' && Sfx.restoreMaster) Sfx.restoreMaster();
+  // v8: victim scream re-arms for the new run.
+  if (typeof Sfx !== 'undefined') { Sfx._victimDone = false; Sfx._victimT = null; }
 
   // Rebuild dynamic visuals, then the one-time full-map flash.
   // (Skipped when the intro sequence owns the reveal timing.)
@@ -2623,6 +2845,11 @@ var Lab = {
     _burst.mat.opacity = 0.5;
     _burstPts.visible = true;
   },
+
+  // v8: claw scratch marks where the creature passed. tx, ty = tile coords.
+  addScratch: function (tx, ty) {
+    _addScratch(tx, ty);
+  },
 };
 
 /* ===== build3d/creature.js ===== */
@@ -2915,6 +3142,10 @@ function _pickWander() {
 // Called right after a step: arrival handling for INVESTIGATE (and v5: HUNT).
 function _afterStep() {
   var c = G.creature;
+  // v8: 22% chance to leave claw marks on a nearby wall after each step.
+  if (typeof Lab !== 'undefined' && Lab.addScratch && Math.random() < 0.22) {
+    try { Lab.addScratch(Math.floor(c.x), Math.floor(c.y)); } catch (e) {}
+  }
   if (c.cstate === 'INVESTIGATE' && c.tgt && c.path.length === 0) {
     if (_radioIndexAt(c.tgt.x, c.tgt.y) >= 0) {
       c.smashT = 1.5; // stand still and smash the radio
@@ -6136,6 +6367,103 @@ const Sfx = {
     } catch (e) {}
   },
 
+  // v8: Pipe bang — a VIOLENT metallic slam from deep in the facility.
+  // Lower, harsher than the distant clang: burst of inharmonic partials +
+  // noise transient, long corridor reverb tail. Something hit the pipes.
+  _pipeBang() {
+    const ctx = this._ctx;
+    if (!ctx || !this._ambPanner) return;
+    const p = G.player;
+    const ang = Math.random() * Math.PI * 2;
+    const dTiles = 10 + Math.random() * 14;
+    const wx = (p.fx + Math.cos(ang) * dTiles) * C.TILE3D;
+    const wz = (p.fy + Math.sin(ang) * dTiles) * C.TILE3D;
+    this._setPannerPos(this._ambPanner, wx, 1.5, wz);
+    const t = ctx.currentTime;
+    try {
+      // metallic body: low inharmonic partials, fast attack, 3s decay
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.30, t + 0.008);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 3.0);
+      const oscs = [];
+      const freqs = [82, 137, 211, 318, 470];
+      for (let i = 0; i < freqs.length; i++) {
+        const o = ctx.createOscillator();
+        o.type = 'triangle';
+        o.frequency.value = freqs[i] * (0.97 + Math.random() * 0.06);
+        o.connect(g); oscs.push(o);
+      }
+      // impact transient: filtered noise burst
+      const src = ctx.createBufferSource();
+      src.buffer = this._noiseBuf;
+      const hp = ctx.createBiquadFilter();
+      hp.type = 'highpass'; hp.frequency.value = 900;
+      const ng = ctx.createGain();
+      ng.gain.setValueAtTime(0.25, t);
+      ng.gain.exponentialRampToValueAtTime(0.0001, t + 0.18);
+      src.connect(hp); hp.connect(ng); ng.connect(g);
+      const nodes = this._voiceOut(g, { panner: this._ambPanner, wet: 0.85 });
+      for (let i = 0; i < oscs.length; i++) nodes.unshift(oscs[i]);
+      nodes.unshift(src);
+      for (let i = 0; i < oscs.length; i++) { oscs[i].start(t); oscs[i].stop(t + 3.1); }
+      src.start(t); src.stop(t + 0.25);
+      this._track('pipebang', oscs[oscs.length - 1], nodes);
+    } catch (e) {}
+  },
+
+  // v8: Victim scream — another soul, somewhere deep in the facility.
+  // ONCE per run. A raw human wail: descending sawtooth with vibrato +
+  // breath noise, ~2.5 s, drenched in corridor reverb. Then silence.
+  _victimScream() {
+    const ctx = this._ctx;
+    if (!ctx || !this._ambPanner) return;
+    const p = G.player;
+    const ang = Math.random() * Math.PI * 2;
+    const dTiles = 16 + Math.random() * 10;
+    const wx = (p.fx + Math.cos(ang) * dTiles) * C.TILE3D;
+    const wz = (p.fy + Math.sin(ang) * dTiles) * C.TILE3D;
+    this._setPannerPos(this._ambPanner, wx, 1.4, wz);
+    const t = ctx.currentTime;
+    try {
+      // wail: sawtooth 700 -> 320 Hz over 2.2 s with 6 Hz vibrato
+      const g = ctx.createGain();
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(0.16, t + 0.15);
+      g.gain.setValueAtTime(0.16, t + 1.6);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + 2.4);
+      const o = ctx.createOscillator();
+      o.type = 'sawtooth';
+      o.frequency.setValueAtTime(700, t);
+      o.frequency.exponentialRampToValueAtTime(320, t + 2.2);
+      const vib = ctx.createOscillator();
+      vib.frequency.value = 6;
+      const vibG = ctx.createGain();
+      vibG.gain.value = 28;
+      vib.connect(vibG); vibG.connect(o.frequency);
+      const lp = ctx.createBiquadFilter();
+      lp.type = 'lowpass'; lp.frequency.value = 2400; lp.Q.value = 1.5;
+      o.connect(lp); lp.connect(g);
+      // breath/gasp noise under the wail
+      const src = ctx.createBufferSource();
+      src.buffer = this._noiseBuf;
+      src.playbackRate.value = 0.6;
+      const bp = ctx.createBiquadFilter();
+      bp.type = 'bandpass'; bp.frequency.value = 1100; bp.Q.value = 1.8;
+      const ng = ctx.createGain();
+      ng.gain.setValueAtTime(0.0001, t + 0.1);
+      ng.gain.exponentialRampToValueAtTime(0.06, t + 0.4);
+      ng.gain.exponentialRampToValueAtTime(0.0001, t + 2.2);
+      src.connect(bp); bp.connect(ng); ng.connect(g);
+      const nodes = this._voiceOut(g, { panner: this._ambPanner, wet: 0.9 });
+      nodes.unshift(o, vib, src);
+      o.start(t); o.stop(t + 2.5);
+      vib.start(t); vib.stop(t + 2.5);
+      src.start(t); src.stop(t + 2.5);
+      this._track('victimscream', o, nodes);
+    } catch (e) {}
+  },
+
   // v7: Whisper — filtered noise burst, panned randomly. Sounds like
   // someone breathing words just out of sight. Pure paranoia fuel.
   _whisper() {
@@ -6418,19 +6746,31 @@ const Sfx = {
       // v7: Ambient scares every 45-90s — rotate between distant clang,
       // whisper, and light flicker. Pure paranoia: they do NOTHING
       // gameplay-wise. The facility feels alive and wrong.
+      // v8: pipe bangs join the rotation (rarer, harsher).
       this._clangT -= dt;
       if (this._clangT <= 0) {
         this._clangT = 45 + Math.random() * 45; // 45-90s
         var roll = Math.random();
-        if (roll < 0.4) {
+        if (roll < 0.32) {
           this._distantClang();
-        } else if (roll < 0.7) {
+        } else if (roll < 0.45) {
+          this._pipeBang();
+        } else if (roll < 0.70) {
           this._whisper();
         } else {
           this._ambientFlicker();
           // Sometimes pair flicker with a soft clang for extra unease
           if (Math.random() < 0.5) this._distantClang();
         }
+      }
+
+      // v8: Victim scream — ONCE per run, 90-240 s in. Someone else is here.
+      // Then never again. Reset on run start (see initRunState below).
+      if (this._victimT == null) this._victimT = 90 + Math.random() * 150;
+      if (!this._victimDone && G.state === 'PLAY' && G.time > this._victimT &&
+          G.noteOpen < 0 && !G.mapOpen) {
+        this._victimDone = true;
+        this._victimScream();
       }
 
       // v6.1 paranoia fake-out: every 60–120 s, a 10% roll. On success: a
@@ -7168,8 +7508,13 @@ function updateHUD() {
 
   // v7: Red edge vignette from heartbeat intensity (max alpha 0.45).
   // Pulses with the heartbeat — the closer it is, the more blood closes in.
+  // v8: RED ALERT — during HUNT the whole screen edge pulses blood-red.
   const heart = (typeof Sfx !== 'undefined' && Sfx._heart01) ? Sfx._heart01 : 0;
-  const vig = inPlay ? Math.min(0.45, heart * 0.45) : 0;
+  let vig = inPlay ? Math.min(0.45, heart * 0.45) : 0;
+  if (inPlay && typeof G !== 'undefined' && G.creature && G.creature.cstate === 'HUNT') {
+    const pulse = 0.30 + 0.18 * Math.sin(performance.now() / 280);
+    vig = Math.max(vig, Math.min(0.55, pulse));
+  }
   const vigPct = Math.round(vig * 100);
   if (vigPct !== L.vig) {
     L.vig = vigPct;
